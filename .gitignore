@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Packaging. The wheel is rebuilt in one command and would only go stale here:
+#   python3 -m pip wheel . --no-deps --no-build-isolation -w dist/
+# install.sh builds it automatically when dist/ is empty.
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Machine-local tool state, not project configuration
+.claude/settings.local.json
+
+# Artifacts the tool itself produces
+capture*.jpg
+shot*.jpg
+updev-art.img
+*.img
+!tests/**/*.img
+inventory*.json
+updev-boot-*.png
+*.ppm

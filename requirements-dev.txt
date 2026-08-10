@@ -1,0 +1,6 @@
+-r requirements.txt
+-r requirements-hardware.txt
+# The suite also runs on stdlib unittest:
+#   python3 -m unittest discover -s tests
+pytest>=7.0
+build>=1.0

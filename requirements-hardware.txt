@@ -1,0 +1,15 @@
+# Optional hardware backends. Each missing library disables exactly one
+# backend's extra detail — updev still runs and says what it skipped.
+#
+# On Raspberry Pi OS prefer apt; the system Python is externally-managed:
+#   sudo apt install python3-psutil python3-smbus2 python3-spidev \
+#                    python3-serial python3-lgpio python3-pil
+#
+# picamera2 is deliberately absent: it needs libcamera bindings pip cannot
+# build. Install it with apt only:  sudo apt install python3-picamera2
+psutil>=5.9          # net      interface addresses, per-NIC counters
+smbus2>=0.4          # i2c      address scanning, register read/write
+spidev>=3.5          # spi      mode/clock detail, loopback test
+pyserial>=3.5        # serial   port enumeration with USB provenance
+lgpio>=0.2           # gpio     chip info and claimed lines
+Pillow>=10.0         # vm       QEMU screenshot -> PNG (else .ppm)

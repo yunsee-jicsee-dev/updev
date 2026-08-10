@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "updev"
+version = "1.0.0"
+description = "One device manager for the whole board: LAN, USB, I2C, SPI, serial, cameras, GPIO, storage and the Raspberry Pi itself."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["raspberry-pi", "device-manager", "i2c", "spi", "usb", "gpio", "hardware"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+]
+
+# Only these two are truly required. Every hardware library is optional: a
+# missing one degrades that backend, it never breaks the program.
+dependencies = [
+    "rich>=13.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# On Raspberry Pi OS these all ship as apt packages (python3-psutil,
+# python3-smbus2, ...) — prefer those over pip, the system Python is
+# externally managed. Every one of these is genuinely optional: a missing
+# library disables exactly one backend's extra detail and nothing else.
+hardware = [
+    "psutil>=5.9",       # net: interface addresses and per-NIC counters
+    "smbus2>=0.4",       # i2c: address scanning and register access
+    "spidev>=3.5",       # spi: mode/clock detail and the loopback test
+    "pyserial>=3.5",     # serial: port enumeration with USB provenance
+    "lgpio>=0.2",        # gpio: chip info and which lines are claimed
+]
+# picamera2 is apt-only in practice (it needs libcamera bindings that pip
+# cannot build), so it is deliberately not listed as a pip extra.
+camera = ["picamera2>=0.3"]
+# Pillow converts the QEMU framebuffer dump to PNG. Without it `floppy boot`
+# still works and just leaves a .ppm.
+vm = ["Pillow>=10.0"]
+dev = ["pytest>=7.0", "build>=1.0"]
+all = [
+    "updev[hardware]",
+    "updev[vm]",
+]
+
+[project.scripts]
+updev = "updev.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yunsee-jicsee-dev/updev"
+
+[tool.setuptools.packages.find]
+include = ["updev*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
