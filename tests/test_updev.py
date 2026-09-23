@@ -2377,3 +2377,1374 @@ class TestUsbPanelDispatch(unittest.TestCase):
         for panel in (IdentityPanel, DescriptorPanel, PathPanel, CameraPanel,
                       NetworkPanel, HubPanel):
             self.assertFalse(panel.WRITES, f"{panel.__name__} claims to write")
+
+
+# ==========================================================================
+# flybrain — the mushroom body that learns this board
+# ==========================================================================
+
+class _FlyFixture(unittest.TestCase):
+    """Scan builders shared by the fly brain tests.
+
+    Every one is a pure `ScanResult`, so the whole circuit is testable without
+    a board — which is the point of keeping `smell()` a pure function.
+    """
+
+    @staticmethod
+    def _devices(n, kind=Kind.USB, status=Status.ONLINE, tags=()):
+        return [
+            Device(uid=f"{kind}:{i}", kind=kind, name=f"d{i}", status=status,
+                   bus=str(kind), tags=list(tags))
+            for i in range(n)
+        ]
+
+    def _board(self, scale=1):
+        """The reference machine: some USB, some storage, a NIC."""
+        return ScanResult(devices=(
+            self._devices(6 * scale, Kind.USB, tags=["hotplug"])
+            + self._devices(3 * scale, Kind.STORAGE)
+            + self._devices(1 * scale, Kind.NET_IFACE)
+        ))
+
+    def _other_board(self):
+        """A different machine entirely: degraded I2C and nothing else."""
+        return ScanResult(devices=(
+            self._devices(6, Kind.I2C, status=Status.DEGRADED)
+            + self._devices(3, Kind.SPI, status=Status.IDLE)
+        ))
+
+
+class TestFlyOlfaction(_FlyFixture):
+    """The antennal lobe and the mushroom body's random projection."""
+
+    def test_the_input_layer_matches_the_antennal_lobe(self):
+        from updev.flybrain import ANTENNAL_LOBE_GLOMERULI, GLOMERULI
+
+        self.assertEqual(len(GLOMERULI), ANTENNAL_LOBE_GLOMERULI)
+        self.assertEqual(len(set(GLOMERULI)), len(GLOMERULI))
+
+    def test_the_tag_is_sparse(self):
+        from updev.flybrain import KENYON_CELLS, SPARSITY, TAG_BITS, smell
+
+        self.assertEqual(TAG_BITS, int(KENYON_CELLS * SPARSITY))
+        self.assertEqual(len(smell(self._board()).tag), TAG_BITS)
+
+    def test_the_same_scan_smells_the_same(self):
+        from updev.flybrain import smell
+
+        self.assertEqual(smell(self._board()).tag, smell(self._board()).tag)
+
+    def test_similar_scans_share_most_of_the_tag(self):
+        """The LSH property: small changes must not scramble the code.
+
+        Without this, familiarity would never generalise — plugging in one
+        extra stick would make a trained board unrecognisable.
+        """
+        from updev.flybrain import smell
+
+        board = smell(self._board())
+        plus_one = ScanResult(devices=self._board().devices + self._devices(1, Kind.USB))
+        self.assertGreater(board.overlap(smell(plus_one)), 0.7)
+
+    def test_different_scans_do_not(self):
+        from updev.flybrain import smell
+
+        self.assertLess(smell(self._board()).overlap(smell(self._other_board())), 0.4)
+
+    def test_gain_control_makes_the_code_scale_invariant(self):
+        """Divisive normalisation is what stops "busy" being the only signal.
+
+        The same machine with three of everything instead of one is the same
+        machine, and must smell like it — *similar*, not identical, because
+        `census:population` legitimately differs between them. What the
+        normalisation buys is that the similarity degrades gently with the
+        scale ratio instead of collapsing, which is what these two assertions
+        pin down between them.
+        """
+        from updev.flybrain import smell
+
+        one = smell(self._board(1))
+        near = one.overlap(smell(self._board(2)))
+        far = one.overlap(smell(self._board(5)))
+        self.assertGreater(far, 0.7)
+        self.assertGreater(near, far)
+
+
+class TestFlyLearning(_FlyFixture):
+    def test_a_naive_fly_finds_everything_novel(self):
+        from updev.flybrain import FlyBrain, Mood
+
+        verdict = FlyBrain().judge(self._board())
+        self.assertEqual(verdict.novelty, 1.0)
+        self.assertEqual(verdict.mood, Mood.STARTLED)
+
+    def test_training_settles_the_trained_state(self):
+        """Six exposures, not three — the headline number is the long-term
+        compartment, which learns slowly on purpose."""
+        from updev.flybrain import FlyBrain, Mood
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board())
+        verdict = brain.judge(self._board())
+        self.assertLess(verdict.novelty, 0.3)
+        self.assertEqual(verdict.mood, Mood.SETTLED)
+
+    def test_training_one_state_does_not_excuse_another(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        self.assertGreater(brain.judge(self._other_board()).novelty, 0.6)
+
+    def test_learn_reports_the_verdict_from_before_it_learned(self):
+        """Otherwise the return value is always "familiar" and says nothing."""
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        self.assertEqual(brain.learn(self._board()).novelty, 1.0)
+
+    def test_dopamine_writes_an_aversive_memory(self):
+        from updev.flybrain import FlyBrain, Mood
+
+        painful = self._board()
+        painful.devices[0].issue(Severity.ERROR, "bus stuck low")
+        painful.devices[1].issue(Severity.ERROR, "no ack")
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(painful)
+
+        # Same shape of machine, no issues this time: familiar, but the fly
+        # remembers that this shape goes wrong.
+        verdict = brain.judge(self._board())
+        self.assertGreater(verdict.aversion, 0.2)
+        self.assertEqual(verdict.mood, Mood.AVERSIVE)
+
+    def test_a_clean_board_writes_no_aversive_memory(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        self.assertEqual(brain.judge(self._board()).aversion, 0.0)
+
+    def test_attention_names_glomeruli_the_memory_cannot_account_for(self):
+        from updev.flybrain import GLOMERULI, FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        attend = brain.judge(self._other_board()).attend
+        self.assertTrue(attend)
+        for name in attend:
+            self.assertIn(name, GLOMERULI)
+
+    def test_a_settled_board_has_nothing_to_attend_to(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board())
+        self.assertEqual(brain.judge(self._board()).attend, [])
+
+    def test_forget_returns_the_fly_to_naive(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        brain.forget()
+        self.assertEqual(brain.judge(self._board()).novelty, 1.0)
+        self.assertEqual(brain.exposures, 0)
+
+
+class TestFlyLateralHorn(_FlyFixture):
+    """The unlearnable path. These are the tests that make it safe to ship."""
+
+    def _catastrophe(self):
+        result = self._board()
+        result.devices[0].issue(Severity.ERROR, "root filesystem is 99% full")
+        return result
+
+    def test_an_error_always_alarms(self):
+        from updev.flybrain import FlyBrain, Mood
+
+        self.assertEqual(FlyBrain().judge(self._catastrophe()).mood, Mood.ALARMED)
+
+    def test_training_cannot_teach_the_fly_to_ignore_it(self):
+        """The whole reason for a parallel innate path.
+
+        A purely learned system trained on a broken board learns that broken
+        is normal. The lateral horn is consulted first and wins outright.
+        """
+        from updev.flybrain import FlyBrain, Mood
+
+        brain = FlyBrain()
+        for _ in range(50):
+            brain.learn(self._catastrophe())
+
+        verdict = brain.judge(self._catastrophe())
+        self.assertLess(verdict.novelty, 0.2)        # thoroughly familiar
+        self.assertEqual(verdict.mood, Mood.ALARMED)  # and still alarming
+        self.assertTrue(verdict.alarms)
+
+    def test_a_failed_backend_alarms(self):
+        from updev.core.model import BackendReport
+        from updev.flybrain import innate_alarms
+
+        result = self._board()
+        result.reports.append(BackendReport("i2c", True, ok=False, error="boom"))
+        self.assertTrue(any(a.channel == "backend" for a in innate_alarms(result)))
+
+    def test_heat_and_a_full_disk_alarm(self):
+        from updev.flybrain import innate_alarms
+
+        result = self._board()
+        result.devices[0].metrics["temp_c"] = 84.0
+        result.devices[1].metrics["fs_used_pct"] = 97.0
+        channels = {a.channel for a in innate_alarms(result)}
+        self.assertEqual(channels, {"thermal", "storage"})
+
+    def test_a_healthy_board_is_silent(self):
+        from updev.flybrain import innate_alarms
+
+        self.assertEqual(innate_alarms(self._board()), [])
+
+    def test_alarms_suppress_the_offer_to_learn(self):
+        from updev.flybrain import FlyBrain
+
+        self.assertFalse(FlyBrain().judge(self._catastrophe()).should_learn)
+        self.assertTrue(FlyBrain().judge(self._board()).should_learn)
+
+
+class TestFlyPersistence(_FlyFixture):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "flybrain.json"
+
+    def test_a_saved_brain_judges_identically(self):
+        from updev.flybrain import FlyBrain, load_brain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        brain.save(self.path)
+
+        restored = load_brain(self.path)
+        self.assertEqual(restored.exposures, brain.exposures)
+        self.assertAlmostEqual(restored.judge(self._board()).novelty,
+                               brain.judge(self._board()).novelty, places=4)
+
+    def test_a_missing_file_hatches_a_naive_fly(self):
+        from updev.flybrain import load_brain
+
+        self.assertEqual(load_brain(self.path / "nope").exposures, 0)
+
+    def test_a_corrupt_file_hatches_a_naive_fly(self):
+        """Confident nonsense is worse than knowing nothing."""
+        from updev.flybrain import load_brain
+
+        self.path.write_text("{not json at all")
+        self.assertEqual(load_brain(self.path).exposures, 0)
+
+    def test_a_memory_from_a_different_input_layer_is_discarded(self):
+        """Weights index Kenyon cells; if the glomeruli changed they are lies."""
+        import json
+
+        from updev.flybrain import FlyBrain, load_brain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        brain.save(self.path)
+
+        data = json.loads(self.path.read_text())
+        data["signature"] = "0000deadbeef0000"
+        self.path.write_text(json.dumps(data))
+
+        stale = load_brain(self.path)
+        self.assertEqual(stale.exposures, 0)
+        self.assertEqual(stale.judge(self._board()).novelty, 1.0)
+
+    def test_saving_is_atomic(self):
+        from updev.flybrain import FlyBrain
+
+        FlyBrain().save(self.path)
+        self.assertTrue(self.path.exists())
+        self.assertFalse(self.path.with_suffix(".tmp").exists())
+
+
+# ==========================================================================
+# fdd — managing the drive, as opposed to building the image
+# ==========================================================================
+
+class TestSurfaceReport(unittest.TestCase):
+    """The bookkeeping around a scan, which is pure and worth pinning down."""
+
+    def _surface(self, bad, scanned=2880):
+        from updev.fdd import Surface
+
+        return Surface(total=2880, bad=list(bad), scanned=scanned)
+
+    def test_contiguous_damage_collapses_into_ranges(self):
+        """Damage is contiguous far more often than scattered; 12 ranges read
+        better than 400 sector numbers."""
+        surface = self._surface([376, 377, 378, 416, 417, 900])
+        self.assertEqual(surface.bad_ranges(), [(376, 378), (416, 417), (900, 900)])
+
+    def test_a_clean_disk_has_no_ranges(self):
+        self.assertEqual(self._surface([]).bad_ranges(), [])
+        self.assertTrue(self._surface([]).healthy)
+
+    def test_good_counts_only_what_was_actually_read(self):
+        surface = self._surface([1, 2], scanned=100)
+        self.assertEqual(surface.good, 98)
+
+    def test_an_unscanned_disk_is_not_healthy(self):
+        """Nothing read is not the same as nothing wrong."""
+        self.assertFalse(self._surface([], scanned=0).healthy)
+
+    def test_damage_in_the_fats_is_called_out_separately(self):
+        """A bad sector below 33 costs the whole disk, not one file."""
+        from updev.fdd import SYSTEM_SECTORS
+
+        self.assertTrue(self._surface([SYSTEM_SECTORS - 1]).system_area_damaged)
+        self.assertFalse(self._surface([SYSTEM_SECTORS]).system_area_damaged)
+
+
+class TestSurfaceScan(unittest.TestCase):
+    """The scan itself, run against files rather than a drive.
+
+    `surface_scan` reads with `os.pread`, so a regular file exercises every
+    path except the one that needs a physically failing disk — and a truncated
+    file reproduces even that, since a short read is how the medium refuses.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "disk.img"
+
+    def _scan(self, **kwargs):
+        from updev.fdd import surface_scan
+
+        last = None
+        for surface in surface_scan(str(self.path), **kwargs):
+            last = surface
+        return last
+
+    def test_a_whole_image_reads_clean(self):
+        from updev.fdd import FLOPPY_SIZE, TOTAL_SECTORS
+
+        self.path.write_bytes(b"\0" * FLOPPY_SIZE)
+        surface = self._scan()
+        self.assertEqual(surface.scanned, TOTAL_SECTORS)
+        self.assertEqual(surface.bad, [])
+        self.assertTrue(surface.healthy)
+
+    def test_a_truncated_image_reports_the_missing_tail_as_bad(self):
+        from updev.fdd import SECTOR, TOTAL_SECTORS
+
+        half = TOTAL_SECTORS // 2
+        self.path.write_bytes(b"\0" * (half * SECTOR))
+        surface = self._scan()
+        self.assertEqual(surface.scanned, TOTAL_SECTORS)
+        self.assertEqual(len(surface.bad), half)
+        self.assertEqual(min(surface.bad), half)
+
+    def test_a_missing_node_aborts_instead_of_raising(self):
+        surface = self._scan()
+        self.assertTrue(surface.aborted)
+        self.assertEqual(surface.scanned, 0)
+
+    def test_the_bad_sector_budget_stops_the_scan(self):
+        """The bound is per track, so it may overshoot by up to one.
+
+        Checking mid-track would mean abandoning a track that was already
+        half read, and `give_up_after` only ever claimed to be a rough
+        ceiling on how much damage is worth enumerating.
+        """
+        from updev.fdd import SECTOR, SECTORS_PER_TRACK, TOTAL_SECTORS
+
+        self.path.write_bytes(b"\0" * SECTOR)          # all but sector 0 unreadable
+        surface = self._scan(give_up_after=40)
+        self.assertTrue(surface.aborted)
+        self.assertGreaterEqual(len(surface.bad), 40)
+        self.assertLess(len(surface.bad), 40 + SECTORS_PER_TRACK)
+        self.assertLess(surface.scanned, TOTAL_SECTORS)
+
+    def test_a_zero_budget_means_no_time_limit(self):
+        from updev.fdd import FLOPPY_SIZE, TOTAL_SECTORS
+
+        self.path.write_bytes(b"\0" * FLOPPY_SIZE)
+        surface = self._scan(budget=0)
+        self.assertEqual(surface.scanned, TOTAL_SECTORS)
+        self.assertEqual(surface.aborted, "")
+
+    def test_progress_is_reported_as_it_goes(self):
+        """The caller needs to draw a bar; a scan that only speaks at the end
+        looks hung for a minute."""
+        from updev.fdd import FLOPPY_SIZE, surface_scan
+
+        self.path.write_bytes(b"\0" * FLOPPY_SIZE)
+        counts = [s.scanned for s in surface_scan(str(self.path))]
+        self.assertGreater(len(counts), 10)
+        self.assertEqual(counts, sorted(counts))
+
+
+class TestMediumReadback(unittest.TestCase):
+    """Round trip: build an image, read it back the way a disk is read."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        from updev.floppy import build_image
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "disk.img"
+        self.path.write_bytes(build_image(label="FLY TEST").data)
+
+    def test_a_built_image_reads_back_as_fat12(self):
+        from updev.fdd import read_medium
+
+        medium = read_medium(str(self.path))
+        self.assertTrue(medium.readable)
+        self.assertTrue(medium.fat12)
+        self.assertIn("FLY TEST", medium.label)
+
+    def test_the_files_come_back(self):
+        from updev.fdd import read_medium
+        from updev.floppy import gallery
+
+        medium = read_medium(str(self.path))
+        names = {entry["name"] for entry in medium.files}
+        for expected in gallery():
+            self.assertIn(expected, names)
+
+    def test_the_volume_label_is_not_listed_as_a_file(self):
+        from updev.fdd import read_medium
+
+        for entry in read_medium(str(self.path)).files:
+            self.assertFalse(entry.get("volume_label"))
+
+    def test_an_unreadable_node_reports_instead_of_raising(self):
+        from updev.fdd import read_medium
+
+        medium = read_medium(str(self.path) + ".nope")
+        self.assertFalse(medium.readable)
+        self.assertTrue(medium.error)
+
+    def test_a_disk_too_short_to_hold_a_system_area_is_refused(self):
+        from updev.fdd import read_medium
+
+        self.path.write_bytes(b"\0" * 1024)
+        medium = read_medium(str(self.path))
+        self.assertFalse(medium.readable)
+
+    def test_an_unformatted_disk_is_readable_but_not_fat12(self):
+        from updev.fdd import FLOPPY_SIZE, read_medium
+
+        self.path.write_bytes(b"\0" * FLOPPY_SIZE)
+        medium = read_medium(str(self.path))
+        self.assertTrue(medium.readable)
+        self.assertFalse(medium.fat12)
+
+
+class TestDriveDiscovery(unittest.TestCase):
+    def _scan(self, *, tags=("FUSB", "storage"), size=1_474_560, with_medium=True):
+        drive = Device(uid="usb:3-2", kind=Kind.USB, name="TEAC", status=Status.ONLINE,
+                       address="3-2", tags=list(tags))
+        devices = [drive]
+        if with_medium:
+            medium = Device(uid="blk:sdb", kind=Kind.STORAGE, name="sdb",
+                            status=Status.ONLINE, node="/dev/sdb", parent="usb:3-2")
+            medium.metrics["size_bytes"] = float(size)
+            devices.append(medium)
+        return ScanResult(devices=devices)
+
+    def test_a_floppy_drive_is_found_with_its_medium(self):
+        from updev.fdd import find_drives
+
+        drives = find_drives(self._scan())
+        self.assertEqual(len(drives), 1)
+        self.assertEqual(drives[0].node, "/dev/sdb")
+        self.assertTrue(drives[0].has_medium)
+        self.assertTrue(drives[0].standard_geometry)
+
+    def test_a_drive_with_no_disk_reports_zero_capacity_not_absence(self):
+        """The block device stays when the disk leaves; it just becomes 0 bytes."""
+        from updev.fdd import find_drives
+
+        drive = find_drives(self._scan(size=0))[0]
+        self.assertFalse(drive.has_medium)
+
+    def test_a_drive_the_kernel_exposes_no_node_for_is_still_reported(self):
+        from updev.fdd import find_drives
+
+        drive = find_drives(self._scan(with_medium=False))[0]
+        self.assertEqual(drive.node, "")
+        self.assertFalse(drive.has_medium)
+
+    def test_other_storage_is_not_mistaken_for_a_floppy(self):
+        from updev.fdd import find_drives
+
+        self.assertEqual(find_drives(self._scan(tags=("SUSB", "storage"))), [])
+
+
+class TestMediumProblems(unittest.TestCase):
+    """The innate judgement the fly's lateral horn consumes."""
+
+    def _drive(self, size=1_474_560):
+        from updev.fdd import Drive
+
+        return Drive(uid="usb:3-2", label="TEAC", node="/dev/sdb", size=size)
+
+    def test_an_empty_drive_is_not_a_fault(self):
+        from updev.fdd import medium_problems
+
+        self.assertEqual(medium_problems(self._drive(size=0), None), [])
+
+    def test_a_healthy_disk_raises_nothing(self):
+        from updev.fdd import Medium, Surface, medium_problems
+
+        medium = Medium(node="/dev/sdb", readable=True, fat12=True)
+        surface = Surface(total=2880, scanned=2880)
+        self.assertEqual(medium_problems(self._drive(), medium, surface), [])
+
+    def test_bad_sectors_are_reported(self):
+        from updev.fdd import Medium, Surface, medium_problems
+
+        medium = Medium(node="/dev/sdb", readable=True, fat12=True)
+        surface = Surface(total=2880, scanned=2880, bad=[376, 377])
+        problems = medium_problems(self._drive(), medium, surface)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("배드섹터", problems[0][0])
+
+    def test_damage_to_the_system_area_is_described_as_worse(self):
+        from updev.fdd import Medium, Surface, medium_problems
+
+        medium = Medium(node="/dev/sdb", readable=True, fat12=True)
+        data = Surface(total=2880, scanned=2880, bad=[900])
+        system = Surface(total=2880, scanned=2880, bad=[5])
+        self.assertNotEqual(
+            medium_problems(self._drive(), medium, data)[0][1],
+            medium_problems(self._drive(), medium, system)[0][1],
+        )
+
+    def test_a_non_standard_capacity_is_flagged(self):
+        from updev.fdd import medium_problems
+
+        problems = medium_problems(self._drive(size=737_280), None)
+        self.assertTrue(any("1.44MB" in m for m, _ in problems))
+
+    def test_an_unreadable_disk_is_flagged(self):
+        from updev.fdd import Medium, medium_problems
+
+        medium = Medium(node="/dev/sdb", readable=False, error="Input/output error")
+        problems = medium_problems(self._drive(), medium)
+        self.assertTrue(any("읽을 수 없습니다" in m for m, _ in problems))
+
+
+class TestFlySmellsAFloppy(unittest.TestCase):
+    """The glomerulus that connects the two halves of this work."""
+
+    def test_the_floppy_class_has_its_own_receptor(self):
+        from updev.flybrain import GLOMERULI
+
+        self.assertIn("tag:FUSB", GLOMERULI)
+
+    def test_a_floppy_appearing_changes_the_smell(self):
+        from updev.flybrain import smell
+
+        plain = [Device(uid=f"usb:{i}", kind=Kind.USB, name=f"d{i}",
+                        status=Status.ONLINE) for i in range(6)]
+        floppy = Device(uid="usb:3-2", kind=Kind.USB, name="TEAC",
+                        status=Status.ONLINE, tags=["FUSB", "storage"])
+
+        before = smell(ScanResult(devices=plain))
+        after = smell(ScanResult(devices=plain + [floppy]))
+        self.assertEqual(before.raw["tag:FUSB"], 0.0)
+        self.assertGreater(after.raw["tag:FUSB"], 0.0)
+        self.assertLess(before.overlap(after), 1.0)
+
+
+# ==========================================================================
+# flybrain — compartments and named states
+# ==========================================================================
+
+class TestCompartments(_FlyFixture):
+    """Three memories on three timescales, which is the whole point."""
+
+    def test_short_term_learns_faster_than_long_term(self):
+        from updev.flybrain import HEADLINE, RECENT, FlyBrain
+
+        brain = FlyBrain()
+        brain.learn(self._board())
+        novelties = brain.novelties(brain.judge(self._board()).percept)
+        self.assertLess(novelties[RECENT], novelties[HEADLINE])
+
+    def test_short_term_forgets_faster_than_long_term(self):
+        import time
+
+        from updev.flybrain import HEADLINE, RECENT, FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board())
+        brain.updated = time.time() - 3600          # γ half-life is 20 minutes
+
+        novelties = brain.novelties(brain.judge(self._board()).percept)
+        self.assertGreater(novelties[RECENT], 0.7)   # an hour is three half-lives
+        self.assertLess(novelties[HEADLINE], 0.3)    # 30 days is untouched
+
+    def test_a_returning_old_state_reads_as_drift(self):
+        """Long-term knows it, short-term does not — the reading a single
+        familiarity number cannot express."""
+        import time
+
+        from updev.flybrain import FlyBrain, Mood
+
+        brain = FlyBrain()
+        for _ in range(8):
+            brain.learn(self._other_board())         # known, but long ago
+        brain.updated = time.time() - 40 * 60
+        for _ in range(6):
+            brain.learn(self._board())               # what it has been doing since
+
+        verdict = brain.judge(self._other_board())
+        self.assertEqual(verdict.mood, Mood.DRIFTED)
+        self.assertGreater(verdict.drift, 0)
+
+    def test_the_state_it_currently_lives_in_is_not_drift(self):
+        from updev.flybrain import FlyBrain, Mood
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board())
+        verdict = brain.judge(self._board())
+        self.assertEqual(verdict.mood, Mood.SETTLED)
+        self.assertLessEqual(verdict.drift, 0)
+
+    def test_not_looking_for_an_hour_is_not_drift(self):
+        """The bug this guards: γ forgets on wall clock whether or not anyone
+        was watching, so a board left alone comes back with an empty short-term
+        memory. Reading that as "this changed recently" is exactly backwards."""
+        import time
+
+        from updev.flybrain import FlyBrain, Mood
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board())
+        brain.updated = time.time() - 3600
+
+        verdict = brain.judge(self._board())         # nothing changed
+        self.assertNotEqual(verdict.mood, Mood.DRIFTED)
+        self.assertFalse(verdict.recent_fresh)
+        self.assertEqual(verdict.drift, 0.0)
+
+    def test_reading_novelty_does_not_rewrite_the_memory(self):
+        """Decay is applied as a scalar at read time, so judging is free of
+        side effects — otherwise `fly watch` would erode the memory."""
+        import time
+
+        from updev.flybrain import HEADLINE, FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        brain.updated = time.time() - 86400
+        before = dict(brain.compartments[HEADLINE].weights)
+
+        for _ in range(5):
+            brain.judge(self._board())
+        self.assertEqual(brain.compartments[HEADLINE].weights, before)
+
+    def test_learning_settles_the_clock_before_writing(self):
+        """Decay owed must be paid before the new exposure lands, or it would
+        decay what was just taught."""
+        import time
+
+        from updev.flybrain import RECENT, FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(4):
+            brain.learn(self._board())
+        brain.updated = time.time() - 7200
+        brain.learn(self._board())
+
+        # Fresh again: the exposure went in after the decay, not before.
+        self.assertLess(brain.novelty(brain.judge(self._board()).percept, RECENT), 0.6)
+
+
+class TestNamedStates(_FlyFixture):
+    def _trained(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(5):
+            brain.learn(self._board(), state="idle")
+        for _ in range(5):
+            brain.learn(self._other_board(), state="busy")
+        return brain
+
+    def test_it_names_the_state_it_is_in(self):
+        brain = self._trained()
+        self.assertEqual(brain.judge(self._board()).recognition.label, "idle")
+        self.assertEqual(brain.judge(self._other_board()).recognition.label, "busy")
+
+    def test_the_answer_is_confident_when_the_states_are_distinct(self):
+        self.assertTrue(self._trained().judge(self._board()).recognition.confident)
+
+    def test_an_unknown_state_is_not_forced_into_a_name(self):
+        """A best match below the floor means the cells that fired were never
+        associated with anything — saying a name would be making it up."""
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(5):
+            brain.learn(self._board(), state="idle")
+        recognition = brain.judge(self._other_board()).recognition
+        self.assertFalse(recognition.confident)
+        self.assertIn("해당 없음", recognition.summary)
+
+    def test_a_brain_with_no_named_states_says_nothing(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        brain.learn(self._board())
+        self.assertEqual(brain.judge(self._board()).recognition.label, "")
+
+    def test_naming_a_state_also_makes_it_familiar(self):
+        """Supervised and unsupervised learning are additive, not exclusive."""
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board(), state="idle")
+        self.assertLess(brain.judge(self._board()).novelty, 0.3)
+
+    def test_one_state_can_be_forgotten_without_the_rest(self):
+        brain = self._trained()
+        self.assertTrue(brain.forget(state="busy"))
+        self.assertEqual(set(brain.states), {"idle"})
+        self.assertFalse(brain.forget(state="busy"))
+
+    def test_states_survive_a_save(self):
+        import tempfile
+        from pathlib import Path
+
+        from updev.flybrain import load_brain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "b.json"
+            self._trained().save(path)
+            self.assertEqual(load_brain(path).judge(self._board()).recognition.label,
+                             "idle")
+
+
+class TestVersionOneMigration(_FlyFixture):
+    """A memory trained before compartments existed must not be thrown away."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "flybrain.json"
+
+    def _write_v1(self):
+        import json
+
+        from updev.flybrain import FlyBrain, glomerulus_signature, smell
+
+        tag = smell(self._board()).tag
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "signature": glomerulus_signature(),
+            "exposures": 6,
+            "created": 1.0,
+            "updated": 0.0,
+            "familiar": {str(k): 0.9 for k in tag},
+            "aversive": {},
+        }))
+        return FlyBrain
+
+    def test_the_old_training_seeds_every_compartment(self):
+        from updev.flybrain import load_brain
+
+        self._write_v1()
+        brain = load_brain(self.path)
+        self.assertEqual(brain.exposures, 6)
+        for comp in brain.compartments.values():
+            self.assertTrue(comp.weights, f"{comp.key} lost its training")
+
+    def test_a_migrated_brain_still_finds_the_board_familiar(self):
+        from updev.flybrain import load_brain
+
+        self._write_v1()
+        self.assertLess(load_brain(self.path).judge(self._board()).novelty, 0.3)
+
+    def test_it_is_written_back_as_version_two(self):
+        import json
+
+        from updev.flybrain import load_brain
+
+        self._write_v1()
+        brain = load_brain(self.path)
+        brain.save(self.path)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 2)
+
+
+class TestFlySmellsAnEject(unittest.TestCase):
+    """Inserting and ejecting a disk must not smell identical.
+
+    The gap this closes: a floppy or card reader keeps its block device when
+    the medium leaves. Same node, same parent, same tags, same status — only
+    the capacity drops to zero. Before `state:empty-bay` nothing sampled
+    capacity, so the two scans hashed to byte-identical tags and the fly was
+    blind to the one event a removable drive actually has.
+    """
+
+    def _board(self, medium_size):
+        drive = Device(uid="usb:3-2", kind=Kind.USB, name="TEAC",
+                       status=Status.ONLINE, bus="usb",
+                       tags=["FUSB", "storage", "hotplug"])
+        block = Device(uid="blk:sdb", kind=Kind.STORAGE, name="sdb",
+                       status=Status.IDLE, bus="usb", node="/dev/sdb",
+                       parent="usb:3-2", tags=["hotplug"])
+        block.metrics["size_bytes"] = float(medium_size)
+        filler = [Device(uid=f"gpio:{i}", kind=Kind.GPIO, name=f"g{i}",
+                         status=Status.ONLINE) for i in range(8)]
+        return ScanResult(devices=[drive, block] + filler)
+
+    def test_an_empty_drive_and_a_loaded_one_smell_different(self):
+        from updev.flybrain import smell
+
+        loaded = smell(self._board(1_474_560))
+        empty = smell(self._board(0))
+        self.assertLess(loaded.overlap(empty), 0.9)
+
+    def test_the_empty_bay_receptor_is_what_separates_them(self):
+        from updev.flybrain import smell
+
+        self.assertEqual(smell(self._board(1_474_560)).raw["state:empty-bay"], 0.0)
+        self.assertGreater(smell(self._board(0)).raw["state:empty-bay"], 0.0)
+
+    def test_they_are_still_recognisably_the_same_board(self):
+        """Ejecting a disk is a change, not a different machine."""
+        from updev.flybrain import smell
+
+        self.assertGreater(
+            smell(self._board(1_474_560)).overlap(smell(self._board(0))), 0.4)
+
+    def test_ejecting_registers_as_novel_to_a_trained_fly(self):
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(6):
+            brain.learn(self._board(1_474_560))
+        loaded = brain.judge(self._board(1_474_560)).novelty
+        empty = brain.judge(self._board(0)).novelty
+        self.assertLess(loaded, 0.3)
+        self.assertGreater(empty, loaded * 2)
+
+    def test_a_drive_with_no_block_device_is_not_counted_as_empty(self):
+        """Absent metrics are not a zero capacity — only a reported 0 counts."""
+        from updev.flybrain import smell
+
+        board = self._board(1_474_560)
+        board.devices[1].metrics.pop("size_bytes")
+        self.assertEqual(smell(board).raw["state:empty-bay"], 0.0)
+
+
+class TestStaleMemoryIsExplained(_FlyFixture):
+    """Discarding training silently makes the fly look broken rather than
+    inconvenienced. When the receptors change it has to say so."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "flybrain.json"
+
+    def _stale_file(self):
+        import json
+
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        for _ in range(5):
+            brain.learn(self._board(), state="idle")
+        brain.learn(self._other_board(), state="busy")
+        brain.save(self.path)
+
+        data = json.loads(self.path.read_text())
+        data["signature"] = "0000deadbeef0000"
+        self.path.write_text(json.dumps(data))
+
+    def test_it_says_why_the_memory_went_away(self):
+        from updev.flybrain import load_brain
+
+        self._stale_file()
+        brain = load_brain(self.path)
+        self.assertEqual(brain.exposures, 0)
+        self.assertIn("입력 계층", brain.reset_reason)
+
+    def test_it_names_the_states_that_have_to_be_retaught(self):
+        from updev.flybrain import load_brain
+
+        self._stale_file()
+        self.assertEqual(load_brain(self.path).lost_states, ["busy", "idle"])
+
+    def test_a_healthy_memory_reports_no_reset(self):
+        from updev.flybrain import FlyBrain, load_brain
+
+        FlyBrain().save(self.path)
+        brain = load_brain(self.path)
+        self.assertEqual(brain.reset_reason, "")
+        self.assertEqual(brain.lost_states, [])
+
+    def test_the_explanation_is_not_persisted(self):
+        """It describes one load, not the memory itself."""
+        import json
+
+        from updev.flybrain import load_brain
+
+        self._stale_file()
+        brain = load_brain(self.path)
+        brain.save(self.path)
+        self.assertNotIn("reset_reason", json.loads(self.path.read_text()))
+        self.assertEqual(load_brain(self.path).reset_reason, "")
+
+
+# ==========================================================================
+# reflex — the output side of the mushroom body
+# ==========================================================================
+
+class _ReflexFixture(unittest.TestCase):
+    """A stand-in verdict, so the refusal rules can be tested one at a time."""
+
+    class _Recognition:
+        def __init__(self, label="idle", confident=True, margin=0.3):
+            self.label = label
+            self.confident = confident
+            self.margin = margin
+
+    class _Verdict:
+        def __init__(self, recognition, alarms=()):
+            self.recognition = recognition
+            self.alarms = list(alarms)
+
+    def _verdict(self, label="idle", confident=True, alarms=()):
+        return self._Verdict(self._Recognition(label, confident), alarms)
+
+    def _book(self, command="true", armed=True):
+        from updev.reflex import ReflexBook
+
+        book = ReflexBook()
+        book.teach("idle", command)
+        book.arm("idle", armed)
+        return book
+
+
+class TestReflexRefusals(_ReflexFixture):
+    """When a reflex must not fire. Each rule gets its own test because each
+    one exists for a different reason."""
+
+    def test_an_armed_reflex_in_its_state_may_fire(self):
+        from updev.reflex import why_not
+
+        book = self._book()
+        self.assertEqual(why_not(book.reflexes["idle"], self._verdict(), ""), "")
+
+    def test_a_disarmed_reflex_never_fires(self):
+        from updev.reflex import why_not
+
+        book = self._book(armed=False)
+        self.assertIn("무장", why_not(book.reflexes["idle"], self._verdict(), ""))
+
+    def test_an_alarm_blocks_every_reflex(self):
+        """The rule that makes this safe to leave running.
+
+        A board in trouble is the worst possible moment to run something
+        unattended, and the lateral horn already outranks training everywhere
+        else in the circuit. It outranks it here too.
+        """
+        from updev.flybrain import Alarm
+        from updev.reflex import why_not
+
+        book = self._book()
+        verdict = self._verdict(alarms=[Alarm("storage", "루트가 꽉 찼습니다")])
+        self.assertIn("측면뿔", why_not(book.reflexes["idle"], verdict, ""))
+
+    def test_an_uncertain_recognition_does_not_act(self):
+        from updev.reflex import why_not
+
+        book = self._book()
+        verdict = self._verdict(confident=False)
+        self.assertIn("확실하지 않", why_not(book.reflexes["idle"], verdict, ""))
+
+    def test_a_reflex_fires_on_entering_a_state_not_while_in_it(self):
+        """Otherwise a watch loop re-runs the command every few seconds."""
+        from updev.reflex import why_not
+
+        book = self._book()
+        self.assertIn("이미", why_not(book.reflexes["idle"], self._verdict(), "idle"))
+
+    def test_a_recent_firing_is_debounced(self):
+        import time
+
+        from updev.reflex import why_not
+
+        book = self._book()
+        reflex = book.reflexes["idle"]
+        reflex.last_fired = time.time()
+        self.assertIn("연타", why_not(reflex, self._verdict(), "busy"))
+
+    def test_another_states_reflex_is_not_a_refusal(self):
+        """Silence, not an excuse — this reflex simply is not the one."""
+        from updev.reflex import why_not
+
+        book = self._book()
+        self.assertEqual(why_not(book.reflexes["idle"], self._verdict("busy"), ""), "")
+
+
+class TestReflexFiring(_ReflexFixture):
+    def test_consider_returns_nothing_when_no_reflex_is_bound(self):
+        book = self._book()
+        self.assertIsNone(book.consider(self._verdict("busy"), "", dry_run=False))
+
+    def test_a_dry_run_does_not_execute(self):
+        book = self._book(command="exit 3")
+        firing = book.consider(self._verdict(), "", dry_run=True)
+        self.assertFalse(firing.ran)
+        self.assertTrue(firing.dry_run)
+        self.assertEqual(book.reflexes["idle"].runs, 0)
+
+    def test_a_live_run_executes_and_records(self):
+        book = self._book(command="exit 0")
+        firing = book.consider(self._verdict(), "", dry_run=False)
+        self.assertTrue(firing.ran)
+        self.assertTrue(firing.ok)
+        self.assertEqual(book.reflexes["idle"].runs, 1)
+        self.assertEqual(book.reflexes["idle"].last_status, 0)
+
+    def test_a_failing_command_is_reported_not_raised(self):
+        book = self._book(command="exit 7")
+        firing = book.consider(self._verdict(), "", dry_run=False)
+        self.assertTrue(firing.ran)
+        self.assertFalse(firing.ok)
+        self.assertEqual(firing.status, 7)
+
+    def test_output_comes_back(self):
+        book = self._book(command="echo 안녕; echo 오류 >&2")
+        firing = book.run(book.reflexes["idle"])
+        self.assertEqual(firing.stdout, "안녕")
+        self.assertEqual(firing.stderr, "오류")
+
+    def test_a_command_that_hangs_is_killed(self):
+        book = self._book(command="sleep 30")
+        book.reflexes["idle"].timeout = 0.3
+        firing = book.run(book.reflexes["idle"])
+        self.assertEqual(firing.status, 124)
+        self.assertFalse(firing.ok)
+
+    def test_the_state_is_passed_to_the_command(self):
+        book = self._book(command="echo $UPDEV_REFLEX_STATE")
+        self.assertEqual(book.run(book.reflexes["idle"]).stdout, "idle")
+
+    def test_an_alarm_stops_a_live_run_from_happening_at_all(self):
+        from updev.flybrain import Alarm
+
+        book = self._book(command="exit 0")
+        verdict = self._verdict(alarms=[Alarm("thermal", "84°C")])
+        firing = book.consider(verdict, "", dry_run=False)
+        self.assertFalse(firing.ran)
+        self.assertEqual(book.reflexes["idle"].runs, 0)
+
+
+class TestReflexBook(_ReflexFixture):
+    def test_teaching_the_same_state_twice_keeps_the_history(self):
+        book = self._book(command="echo one")
+        book.reflexes["idle"].runs = 5
+        book.teach("idle", "echo two")
+        self.assertEqual(book.reflexes["idle"].command, "echo two")
+        self.assertEqual(book.reflexes["idle"].runs, 5)
+
+    def test_a_retaught_reflex_comes_back_disarmed(self):
+        """The command changed; the decision to let it run unattended did not
+        carry over to it."""
+        book = self._book(command="echo one")
+        self.assertTrue(book.reflexes["idle"].armed)
+        book.teach("idle", "rm -rf /tmp/something")
+        self.assertFalse(book.reflexes["idle"].armed)
+
+    def test_dropping_one_leaves_the_others(self):
+        book = self._book()
+        book.teach("busy", "echo busy")
+        self.assertTrue(book.drop("idle"))
+        self.assertEqual(set(book.reflexes), {"busy"})
+        self.assertFalse(book.drop("idle"))
+
+    def test_a_round_trip_preserves_everything(self):
+        from updev.reflex import ReflexBook
+
+        book = self._book(command="echo 안녕")
+        book.reflexes["idle"].runs = 3
+        restored = ReflexBook.from_dict(book.as_dict())
+        self.assertEqual(restored.reflexes["idle"].command, "echo 안녕")
+        self.assertTrue(restored.reflexes["idle"].armed)
+        self.assertEqual(restored.reflexes["idle"].runs, 3)
+
+    def test_garbage_loads_as_an_empty_book(self):
+        from updev.reflex import ReflexBook
+
+        self.assertEqual(ReflexBook.from_dict("not a dict").reflexes, {})
+        self.assertEqual(ReflexBook.from_dict({"idle": "nope"}).reflexes, {})
+
+    def test_an_entry_with_no_command_is_dropped(self):
+        from updev.reflex import ReflexBook
+
+        self.assertEqual(ReflexBook.from_dict({"idle": {"command": ""}}).reflexes, {})
+
+    def test_reflexes_live_beside_the_brain_not_inside_it(self):
+        """Weights die when the glomeruli change; bindings must not."""
+        from pathlib import Path
+
+        from updev.flybrain import reflex_path
+
+        brain = Path("/tmp/x/flybrain.json")
+        self.assertEqual(reflex_path(brain).parent, brain.parent)
+        self.assertNotEqual(reflex_path(brain), brain)
+
+
+class TestDestructiveWarnings(unittest.TestCase):
+    """Not a filter — nothing is blocked. It exists so that arming a reflex
+    that runs `dd` says so out loud."""
+
+    def test_it_names_what_it_found(self):
+        from updev.reflex import looks_destructive
+
+        hits = looks_destructive("dd if=/dev/zero of=/dev/sdb")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("dd", hits[0])
+
+    def test_several_patterns_are_all_reported(self):
+        from updev.reflex import looks_destructive
+
+        self.assertGreaterEqual(
+            len(looks_destructive("sudo rm -rf /var/log && reboot")), 3)
+
+    def test_an_ordinary_command_is_quiet(self):
+        from updev.reflex import looks_destructive
+
+        self.assertEqual(looks_destructive("logger 디스켓이 빠졌습니다"), [])
+        self.assertEqual(looks_destructive("echo hello >> /tmp/log"), [])
+
+
+# ==========================================================================
+# algo — recognising algorithms by their constants
+# ==========================================================================
+
+class _AlgoFixture(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def _blob(self, data: bytes, name="x.bin"):
+        path = self.dir / name
+        path.write_bytes(data)
+        return path
+
+    @staticmethod
+    def _found(report):
+        return {f.algorithm for f in report.findings}
+
+
+class TestAlgoConstants(_AlgoFixture):
+    def test_the_ansi_lcg_is_recognised(self):
+        import struct
+
+        from updev.algo import analyse
+
+        blob = b"\x00" * 64 + struct.pack("<I", 1103515245) + b"\x00" * 16 \
+            + struct.pack("<I", 12345) + b"\x00" * 64
+        self.assertIn("LCG", self._found(analyse(self._blob(blob))))
+
+    def test_a_big_endian_constant_is_found_too(self):
+        import struct
+
+        from updev.algo import analyse
+
+        blob = b"\x00" * 32 + struct.pack(">I", 0xEDB88320) + b"\x00" * 32
+        self.assertIn("CRC-32", self._found(analyse(self._blob(blob))))
+
+    def test_the_quake_constant_is_unique(self):
+        import struct
+
+        from updev.algo import analyse
+
+        report = analyse(self._blob(b"\x00" * 16 + struct.pack("<I", 0x5F3759DF)))
+        finding = next(f for f in report.findings
+                       if f.algorithm == "fast inverse sqrt")
+        self.assertTrue(finding.certain)
+
+    def test_the_aes_sbox_is_found_by_its_bytes(self):
+        from updev.algo import analyse
+
+        sbox = bytes((0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5))
+        self.assertIn("AES", self._found(analyse(self._blob(b"\x11" * 100 + sbox))))
+
+    def test_an_empty_file_is_reported_not_raised(self):
+        from updev.algo import analyse
+
+        self.assertTrue(analyse(self._blob(b"")).error)
+
+    def test_a_missing_file_is_reported_not_raised(self):
+        from updev.algo import analyse
+
+        report = analyse(self.dir / "nope.bin")
+        self.assertTrue(report.error)
+        self.assertEqual(report.findings, [])
+
+
+class TestAlgoRestraint(_AlgoFixture):
+    """The tool has to be quiet about things it has no evidence for."""
+
+    def test_random_bytes_do_not_produce_unique_findings(self):
+        """A false 'unique' is the worst failure this can have: it is the
+        verdict a reader is meant to be able to rely on."""
+        import random
+
+        from updev.algo import Strength, analyse
+
+        rng = random.Random(20260923)
+        blob = bytes(rng.randrange(256) for _ in range(200_000))
+        report = analyse(self._blob(blob))
+        certain = [f.algorithm for f in report.findings
+                   if f.strength is Strength.UNIQUE]
+        self.assertEqual(certain, [])
+
+    def test_a_file_of_zeros_finds_nothing(self):
+        from updev.algo import analyse
+
+        self.assertEqual(analyse(self._blob(b"\x00" * 100_000)).findings, [])
+
+    def test_a_lone_half_of_a_constant_is_not_enough(self):
+        """0x4E6D on its own is an ordinary 16-bit number."""
+        import struct
+
+        from updev.algo import analyse
+
+        blob = b"\x7fELF" + b"\x00" * 14 + b"\xb7\x00" + b"\x00" * 40
+        blob += struct.pack("<I", 0x5289CDA8)        # movz w8, #0x4e6d
+        self.assertNotIn("LCG", self._found(analyse(self._blob(blob))))
+
+    def test_the_report_says_absence_is_not_evidence(self):
+        from updev.algo import analyse
+
+        report = analyse(self._blob(b"\x00" * 1024))
+        self.assertIn("증거는 아닙니다", report.summary)
+
+
+class TestAlgoAArch64(_AlgoFixture):
+    """A fixed-width ISA cannot hold a 32-bit constant in one instruction, so
+    the byte search — the whole method — finds nothing. This is not
+    hypothetical: the LCG that matches instantly in a DOS build is invisible
+    in the AArch64 port of the same program for exactly this reason."""
+
+    def _elf(self, words):
+        import struct
+
+        blob = bytearray(b"\x7fELF" + b"\x00" * 14 + b"\xb7\x00" + b"\x00" * 40)
+        for word in words:
+            blob += struct.pack("<I", word)
+        return bytes(blob)
+
+    def test_a_split_constant_is_recovered_from_the_immediates(self):
+        from updev.algo import analyse
+
+        # mov w8, #0x4e6d ; movk w8, #0x41c6, lsl #16  — 1103515245
+        # mov w7, #0x3039                              — 12345
+        blob = self._elf((0x5289CDA8, 0x72A838C8, 0x52860727))
+        report = analyse(self._blob(blob))
+        self.assertIn("LCG", self._found(report))
+
+    def test_the_evidence_says_it_came_from_an_immediate(self):
+        from updev.algo import analyse
+
+        blob = self._elf((0x5289CDA8, 0x72A838C8, 0x52860727))
+        finding = next(f for f in analyse(self._blob(blob)).findings
+                       if f.algorithm == "LCG")
+        self.assertTrue(any(e.where == "immediate" for e in finding.evidence))
+
+    def test_immediates_are_not_searched_on_other_architectures(self):
+        """The encoding is AArch64's; reading those bit fields out of x86
+        would be inventing hits."""
+        import struct
+
+        from updev.algo import analyse
+
+        blob = bytearray(b"\x7fELF" + b"\x00" * 14 + b"\x3e\x00" + b"\x00" * 40)
+        for word in (0x5289CDA8, 0x72A838C8, 0x52860727):
+            blob += struct.pack("<I", word)
+        self.assertNotIn("LCG", self._found(analyse(self._blob(bytes(blob)))))
+
+
+class TestAlgoReport(_AlgoFixture):
+    def test_findings_are_ranked_with_the_strongest_first(self):
+        import struct
+
+        from updev.algo import analyse
+
+        blob = struct.pack("<I", 65536) + b"\x00" * 32 \
+            + struct.pack("<I", 1103515245) + struct.pack("<I", 12345)
+        report = analyse(self._blob(blob))
+        self.assertEqual(report.findings[0].algorithm, "LCG")
+
+    def test_a_dos_com_file_is_named_as_raw(self):
+        from updev.algo import analyse
+
+        self.assertEqual(analyse(self._blob(b"\xeb\x3c\x90" + b"\x00" * 600)).kind,
+                         "raw binary")
+
+    def test_a_boot_sector_is_recognised_by_its_signature(self):
+        from updev.algo import analyse
+
+        blob = bytearray(b"\x00" * 512)
+        blob[510:512] = b"\x55\xaa"
+        self.assertIn("부트섹터", analyse(self._blob(bytes(blob))).kind)
+
+    def test_an_elf_without_a_symtab_reads_as_stripped(self):
+        from updev.algo import analyse
+
+        blob = b"\x7fELF" + b"\x00" * 14 + b"\xb7\x00" + b"\x00" * 200
+        self.assertTrue(analyse(self._blob(blob)).stripped)
+
+    def test_the_whole_report_survives_json(self):
+        import json
+        import struct
+
+        from updev.algo import analyse
+
+        report = analyse(self._blob(struct.pack("<I", 0xEDB88320)))
+        self.assertIn("CRC-32", json.dumps(report.as_dict(), ensure_ascii=False))

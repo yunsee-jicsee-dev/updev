@@ -1293,6 +1293,1022 @@ def floppy_info(state: State, image):
 
 
 # ==========================================================================
+# fly — the mushroom body that learns this board
+# ==========================================================================
+
+@cli.group()
+def fly():
+    """날파리가 이 보드를 관리한다 — 초파리 후각 학습 회로.
+
+    Threshold rules can't tell you that 78°C is normal *for this Pi with the
+    camera on* and 71°C at 3am is not. The fly's mushroom body answers exactly
+    that question with 2,000 neurons and no network: it learns what this board
+    smells like, and says when the smell changes.
+
+    Train it with `updev fly learn` whenever the board is in a state you
+    consider normal. Everything runs offline; nothing is downloaded.
+    """
+
+
+def _brain_and_verdict(state: State, path):
+    from .flybrain import load_brain
+
+    brain = load_brain(Path(path) if path else None)
+    result = state.scan()
+    return brain, result, brain.judge(result)
+
+
+def _verdict_panel(verdict, brain) -> Panel:
+    from .flybrain import COMPARTMENT_SPECS, GLOMERULI, MOOD_STYLE, RECENT
+
+    style = MOOD_STYLE[verdict.mood]
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("판정", Text(verdict.label, style=f"bold {style}"))
+    if verdict.recognition.label:
+        head.add_row("상태", Text(
+            verdict.recognition.summary,
+            style="bold cyan" if verdict.recognition.confident else "dim",
+        ))
+    head.add_row("aversion", _bar(verdict.aversion, "MBON-γ1pedc"))
+    head.add_row("학습 횟수", Text(f"{verdict.exposures}회", style="dim"))
+
+    body = [head]
+
+    # The three compartments, which is where the interesting reading lives:
+    # a board can be familiar over weeks and unfamiliar over minutes.
+    lobes = Table.grid(padding=(0, 2))
+    lobes.add_column(style="dim", justify="right", no_wrap=True)
+    lobes.add_column()
+    for key, title, half_life, _rate in COMPARTMENT_SPECS:
+        novelty = verdict.compartments.get(key)
+        if novelty is None:
+            continue
+        stale = key == RECENT and not verdict.recent_fresh
+        bar = _bar(novelty, _half_life_label(half_life))
+        if stale:
+            bar.append("  (오래 안 봐서 판단 보류)", style="dim italic")
+        lobes.add_row(title, bar)
+    body += [Text("\nnovelty — 구획별 (MBON-α'3)", style="bold"), lobes]
+
+    if verdict.recent_fresh and abs(verdict.drift) >= 0.05:
+        if verdict.drift > 0:
+            body.append(Text(
+                f"최근 모습과의 차이 +{verdict.drift:.2f} — 이 보드가 원래 하는 "
+                "일이지만 요즘 하던 건 아닙니다.", style="yellow"))
+        else:
+            body.append(Text(
+                f"최근 모습과의 차이 {verdict.drift:.2f} — 지금 지내고 있는 "
+                "상태입니다.", style="dim"))
+
+    if verdict.alarms:
+        alarms = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        alarms.add_column("경로", style="bright_red", no_wrap=True)
+        alarms.add_column("내용")
+        alarms.add_column("대응", style="dim", overflow="fold")
+        for alarm in verdict.alarms:
+            alarms.add_row(alarm.channel, alarm.message, alarm.detail)
+        body += [Text("\n측면뿔 (학습으로 끌 수 없음)", style="bold bright_red"), alarms]
+
+    smells = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+    smells.add_column("사구체", style="bold", no_wrap=True)
+    smells.add_column("반응", justify="right", width=7)
+    smells.add_column("", ratio=1)
+    for name, value in verdict.percept.strongest:
+        smells.add_row(name, f"{value:.3f}", _sparkbar(value))
+    body += [Text(f"\n가장 강한 냄새 ({len(GLOMERULI)}개 사구체 중)", style="bold"), smells]
+
+    if verdict.attend:
+        body.append(Text(
+            "\n중심복합체가 주목하는 곳: " + ", ".join(verdict.attend),
+            style="cyan",
+        ))
+    if verdict.should_learn:
+        body.append(Text(
+            "\n낯설지만 문제는 없다. 이게 정상이면: updev fly learn",
+            style="dim italic",
+        ))
+
+    return Panel(Group(*body), title=f"🪰  {verdict.mood}", title_align="left",
+                 border_style=style, box=box.ROUNDED)
+
+
+def _half_life_label(seconds: float) -> str:
+    """"20분", "12시간", "30일" — the timescale, in the unit that reads."""
+    if seconds < 3600:
+        return f"반감기 {seconds / 60:.0f}분"
+    if seconds < 86400:
+        return f"반감기 {seconds / 3600:.0f}시간"
+    return f"반감기 {seconds / 86400:.0f}일"
+
+
+def _bar(value: float, label: str, width: int = 24) -> Text:
+    filled = int(round(value * width))
+    style = "green" if value < 0.3 else "yellow" if value < 0.6 else "bright_red"
+    out = Text()
+    out.append("█" * filled, style=style)
+    out.append("░" * (width - filled), style="dim")
+    out.append(f"  {value:.2f}  ", style=style)
+    out.append(label, style="dim")
+    return out
+
+
+def _sparkbar(value: float, width: int = 18) -> Text:
+    filled = int(round(min(1.0, value) * width))
+    return Text("▉" * filled + "·" * (width - filled), style="dim cyan")
+
+
+@fly.command("sniff")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_sniff(state: State, path):
+    """지금 이 보드가 어떤 냄새인지 — 학습은 하지 않는다."""
+    brain, _, verdict = _brain_and_verdict(state, path)
+    if state.as_json:
+        state.emit({"verdict": verdict.as_dict(), "brain": brain.stats()})
+        return
+    state.console.print(_verdict_panel(verdict, brain))
+
+
+@fly.command("learn")
+@click.option("-n", "--times", type=int, default=1, show_default=True,
+              help="Repeat the exposure (one scan, imprinted N times).")
+@click.option("--as", "as_state", metavar="NAME",
+              help="Also teach this scan as a named state (e.g. idle, recording).")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_learn(state: State, times, as_state, path):
+    """지금 상태를 '정상'으로 각인시킨다.
+
+    Each compartment moves its own distance toward familiar, so the short-term
+    lobe settles in two or three calls and the long-term one — the number shown
+    as `novelty` — takes five or six. That is the point of having both. Issues
+    present at training time also write the aversive memory, so the fly learns
+    the shape *and* that the shape tends to go wrong.
+
+    `--as NAME` additionally teaches the scan as a named state, so the fly can
+    later say which of the states it knows the board is in. Naming is additive:
+    a named state is still a familiar one.
+    """
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+    result = state.scan()
+    before = None
+    for _ in range(max(1, times)):
+        verdict = brain.learn(result, state=as_state or "")
+        before = before or verdict
+    saved = brain.save(target)
+    after = brain.judge(result)
+
+    if state.as_json:
+        state.emit({
+            "before": before.as_dict(), "after": after.as_dict(),
+            "state": as_state or None,
+            "brain": brain.stats(), "path": str(saved),
+        })
+        return
+
+    state.console.print(_verdict_panel(after, brain))
+    tail = f"[dim]각인 완료 — novelty {before.novelty:.2f} → {after.novelty:.2f}, " \
+           f"누적 {brain.exposures}회"
+    if as_state:
+        tail += f" · 상태 이름 '{as_state}'"
+    state.console.print(tail + f" · {saved}[/dim]")
+
+
+@fly.command("states")
+@click.option("--forget", "drop", metavar="NAME",
+              help="Forget one named state.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_states(state: State, drop, path):
+    """이름 붙여 가르친 상태들, 그리고 지금은 어느 쪽인지."""
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+
+    if drop:
+        if brain.forget(state=drop):
+            brain.save(target)
+            state.console.print(f"[yellow]'{drop}' 를 잊었습니다.[/yellow]")
+        else:
+            raise click.ClickException(f"그런 상태가 없습니다: {drop}")
+        return
+
+    if not brain.states:
+        if state.as_json:
+            state.emit({"states": {}, "current": None})
+            return
+        state.console.print(Panel(
+            Text("이름 붙은 상태가 없습니다.\n\n"
+                 "보드가 어떤 상태일 때 이름을 붙여 가르치면, 이후 그게 어떤 "
+                 "상태인지 말해줍니다:\n\n"
+                 "  updev fly learn --as idle\n"
+                 "  updev fly learn --as recording\n\n"
+                 "상태마다 서너 번씩 가르치면 구분이 섭니다.", style="dim"),
+            title="🪰  states", title_align="left",
+            border_style="dim", box=box.ROUNDED,
+        ))
+        return
+
+    result = state.scan()
+    verdict = brain.judge(result)
+    recognition = verdict.recognition
+
+    if state.as_json:
+        state.emit({
+            "states": brain.stats()["states"],
+            "current": recognition.as_dict(),
+        })
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    table.add_column("상태", style="bold", no_wrap=True)
+    table.add_column("일치도", justify="right", width=8)
+    table.add_column("", ratio=1)
+
+    scores = dict([(recognition.label, recognition.score)] + recognition.runners)
+    for name in sorted(brain.states):
+        score = scores.get(name, 0.0)
+        current = name == recognition.label and recognition.score >= recognition.FLOOR
+        table.add_row(
+            Text(name, style="bold cyan" if current else "bold"),
+            f"{score:.3f}",
+            _sparkbar(score),
+        )
+
+    state.console.print(Panel(
+        Group(table, Text(f"\n지금: {recognition.summary}",
+                          style="bold cyan" if recognition.confident else "yellow")),
+        title="🪰  states", title_align="left",
+        border_style="cyan", box=box.ROUNDED,
+    ))
+
+
+@fly.command("watch")
+@click.option("-i", "--interval", type=float, default=5.0, show_default=True,
+              help="Seconds between sniffs.")
+@click.option("-n", "--iterations", type=int, default=None,
+              help="Stop after this many sniffs.")
+@click.option("--quiet", is_flag=True,
+              help="Only print when the mood is not 'settled'.")
+@click.option("--act", is_flag=True,
+              help="Fire armed reflexes. Without this they are only reported.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_watch(state: State, interval, iterations, quiet, act, path):
+    """계속 냄새를 맡으며 낯선 변화가 생기면 알린다.
+
+    `--act` 를 주면 무장된 반사를 실제로 실행한다. 이게 tty에 상주하는 형태다 —
+    날파리가 계속 냄새를 맡다가, 아는 상태에 들어서면 배운 명령을 돌린다.
+    """
+    from .flybrain import MOOD_STYLE, Mood, load_brain
+
+    if state.as_json:
+        raise click.UsageError("--json cannot be combined with watch")
+
+    brain = load_brain(Path(path) if path else None)
+    if not brain.exposures:
+        state.console.print(
+            "[yellow]아직 학습되지 않은 뇌입니다 — 모든 게 낯설게 보입니다. "
+            "먼저 `updev fly learn`을 몇 번 실행하세요.[/yellow]\n"
+        )
+
+    book, book_path = _load_reflexes(path)
+    armed = [r for r in book.reflexes.values() if r.armed]
+    if armed:
+        how = "실행" if act else "보고만"
+        state.console.print(
+            f"[dim]무장된 반사 {len(armed)}개 ({', '.join(r.state for r in armed)}) — "
+            f"{how}합니다.[/dim]")
+    elif act:
+        state.console.print(
+            "[yellow]--act 를 줬지만 무장된 반사가 없습니다 — "
+            "updev fly reflex arm <상태> --yes[/yellow]")
+
+    count = 0
+    previous = None
+    previous_state = ""
+    try:
+        while iterations is None or count < iterations:
+            verdict = brain.judge(state.scan())
+            changed = previous is None or verdict.mood is not previous
+            if not quiet or verdict.mood is not Mood.SETTLED or changed:
+                stamp = time.strftime("%H:%M:%S")
+                line = Text(f"{stamp}  ", style="dim")
+                line.append(f"{verdict.mood:9s}", style=f"bold {MOOD_STYLE[verdict.mood]}")
+                line.append(f"  novelty {verdict.novelty:.2f}", style="dim")
+                if verdict.recognition.confident:
+                    line.append(f"  [{verdict.recognition.label}]", style="cyan")
+                if verdict.aversion > 0.1:
+                    line.append(f"  aversion {verdict.aversion:.2f}", style="magenta")
+                if verdict.attend:
+                    line.append(f"  ← {', '.join(verdict.attend[:2])}", style="cyan")
+                state.console.print(line)
+                for alarm in verdict.alarms:
+                    state.console.print(
+                        f"    [bright_red]{alarm.channel}[/bright_red] {alarm.message}"
+                    )
+
+            firing = book.consider(verdict, previous_state, dry_run=not act)
+            if firing is not None:
+                _print_firing_line(state, firing)
+                if firing.ran:
+                    _save_reflexes(book, book_path)
+
+            # Only advance the remembered state on a confident reading, so a
+            # moment of ambiguity does not count as having left the state and
+            # re-fire the reflex on the way back in.
+            if verdict.recognition.confident:
+                previous_state = verdict.recognition.label
+            previous = verdict.mood
+            count += 1
+            if iterations is None or count < iterations:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        state.console.print("[dim]중단됨[/dim]")
+
+
+def _print_firing_line(state: State, firing) -> None:
+    """One indented line per reflex decision, to sit under the watch line."""
+    mark = "▶" if firing.ran else "·"
+    if firing.ran:
+        style = "green" if firing.ok else "bright_red"
+        detail = f"rc={firing.status} ({firing.duration:.2f}s)"
+    else:
+        style = "dim"
+        detail = firing.refused
+    line = Text(f"    {mark} reflex ", style=style)
+    line.append(firing.reflex.state, style="bold cyan")
+    line.append(f"  {detail}", style=style)
+    state.console.print(line)
+    for stream, colour in ((firing.stdout, "dim"), (firing.stderr, "red")):
+        for row in stream.splitlines()[:3]:
+            state.console.print(Text(f"        {row}", style=colour))
+
+
+@fly.command("floppy")
+@click.option("--surface", is_flag=True,
+              help="Read every sector to find bad ones. Read-only, but slow.")
+@click.option("--budget", type=float, default=None,
+              help="Seconds to allow the surface scan (0 = no limit).")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_floppy(state: State, surface, budget, path):
+    """날파리가 플로피 드라이브를 관리한다.
+
+    Finds every USB floppy drive, reports whether a disk is in it and whether
+    that disk can still be read, and folds the answer into the fly's judgement
+    — a drive appearing is a change in what this board *is*, which is exactly
+    what the mushroom body is for.
+
+    `--surface` reads all 2,880 sectors to find the bad ones. It is the only
+    way to know: a failing floppy reports full capacity and online status right
+    up until the sector you needed. Nothing here ever writes to a disk.
+    """
+    from .fdd import DEFAULT_BUDGET, find_drives, medium_problems, read_medium, surface_scan
+    from .flybrain import load_brain
+
+    brain = load_brain(Path(path) if path else None)
+    result = state.scan()
+    drives = find_drives(result)
+    verdict = brain.judge(result)
+
+    if not drives:
+        if state.as_json:
+            state.emit({"drives": [], "verdict": verdict.as_dict()})
+            return
+        state.console.print(Panel(
+            Text("플로피 드라이브가 없습니다.\n\n"
+                 "USB 플로피를 꽂으면 usbclass가 FUSB로 판정하고, 날파리는 "
+                 "그걸 이 보드의 냄새가 바뀐 것으로 감지합니다.", style="dim"),
+            title="🪰  fdd", title_align="left", border_style="dim", box=box.ROUNDED,
+        ))
+        return
+
+    from .flybrain import Alarm, Mood
+
+    payload = []
+    for drive in drives:
+        medium = read_medium(drive.node) if drive.has_medium and drive.node else None
+        scan = None
+        if surface and drive.has_medium and drive.node:
+            scan = _run_surface(state, drive, budget if budget is not None else DEFAULT_BUDGET)
+        problems = medium_problems(drive, medium, scan)
+        payload.append({
+            "drive": drive.as_dict(),
+            "medium": medium.as_dict() if medium else None,
+            "surface": scan.as_dict() if scan else None,
+            "problems": [{"message": m, "advice": a} for m, a in problems],
+        })
+
+        # Fold them into the verdict for real, rather than printing them beside
+        # it: a damaged disk is exactly the kind of thing the lateral horn
+        # exists for, and it must outrank however familiar the board smells.
+        for message, advice in problems:
+            verdict.alarms.append(Alarm("floppy", f"{drive.label}: {message}", advice))
+        if problems:
+            verdict.mood = Mood.ALARMED
+
+        if not state.as_json:
+            state.console.print(_fdd_panel(drive, medium, scan, problems))
+
+    if state.as_json:
+        state.emit({"drives": payload, "verdict": verdict.as_dict()})
+        return
+
+    state.console.print(_verdict_panel(verdict, brain))
+
+
+def _run_surface(state: State, drive, budget: float):
+    """Drive the scan with a live progress bar — it is far too slow to be silent."""
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+
+    from .fdd import surface_scan
+
+    final = None
+    with Progress(
+        TextColumn("[cyan]표면 스캔"),
+        BarColumn(bar_width=30),
+        TextColumn("{task.completed}/{task.total} 섹터"),
+        TextColumn("[red]{task.fields[bad]} bad"),
+        TimeElapsedColumn(),
+        console=state.console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("scan", total=0, bad=0)
+        for surface in surface_scan(drive.node, give_up_after=300, budget=budget):
+            progress.update(task, total=surface.total, completed=surface.scanned,
+                            bad=len(surface.bad))
+            final = surface
+    return final
+
+
+def _fdd_panel(drive, medium, surface, problems) -> Panel:
+    from .fdd import FLOPPY_SIZE
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("드라이브", Text(drive.label, style="bold"))
+    head.add_row("USB", Text(drive.usb_address or "-", style="dim"))
+    head.add_row("장치", Text(drive.node or "(매체 없음)", style="dim"))
+
+    if not drive.has_medium:
+        head.add_row("디스켓", Text("없음 — 드라이브는 정상", style="yellow"))
+        return Panel(head, title="🪰  fdd", title_align="left",
+                     border_style="yellow", box=box.ROUNDED)
+
+    geometry = "1.44MB 표준" if drive.standard_geometry else f"{drive.size:,} 바이트"
+    head.add_row("디스켓", Text(f"있음 · {geometry}",
+                              style="green" if drive.standard_geometry else "yellow"))
+    if medium:
+        head.add_row("내용", Text(medium.summary,
+                                style="green" if medium.fat12 else "yellow"))
+
+    body = [head]
+
+    if medium and medium.files:
+        listing = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        listing.add_column("파일", style="bold")
+        listing.add_column("클러스터", justify="right", style="dim")
+        listing.add_column("바이트", justify="right")
+        for entry in medium.files:
+            listing.add_row(entry["name"], str(entry["cluster"]), f"{entry['size']:,}")
+        body += [Text("\n루트 디렉터리", style="bold"), listing]
+    elif medium and medium.fat12:
+        body.append(Text("\n포맷은 되어 있지만 파일이 없습니다 — 빈 디스켓입니다.",
+                         style="dim italic"))
+
+    if surface is not None:
+        pct = surface.good / surface.scanned * 100 if surface.scanned else 0
+        style = "green" if surface.healthy else "bright_red"
+        stat = Table.grid(padding=(0, 2))
+        stat.add_column(style="dim", justify="right", no_wrap=True)
+        stat.add_column()
+        stat.add_row("확인한 섹터", Text(f"{surface.scanned:,} / {surface.total:,}"))
+        stat.add_row("읽힘", Text(f"{surface.good:,}  ({pct:.1f}%)", style=style))
+        stat.add_row("배드섹터", Text(f"{len(surface.bad):,}",
+                                   style="green" if surface.healthy else "bright_red"))
+        if surface.bad:
+            runs = ", ".join(f"{a}" if a == b else f"{a}–{b}"
+                             for a, b in surface.bad_ranges()[:10])
+            more = "" if len(surface.bad_ranges()) <= 10 else " …"
+            stat.add_row("위치", Text(runs + more, style="red", overflow="fold"))
+        if surface.aborted:
+            stat.add_row("중단", Text(surface.aborted, style="yellow"))
+        body += [Text("\n표면 스캔", style="bold"), stat]
+    elif drive.has_medium:
+        body.append(Text(
+            "\n배드섹터는 --surface 로 전수 검사해야 알 수 있습니다 "
+            "(읽기 전용, 1분 안팎).", style="dim italic"))
+
+    if problems:
+        trouble = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        trouble.add_column("문제", style="bright_red", overflow="fold")
+        trouble.add_column("대응", style="dim", overflow="fold")
+        for message, advice in problems:
+            trouble.add_row(message, advice)
+        body += [Text("\n측면뿔", style="bold bright_red"), trouble]
+
+    border = "bright_red" if problems else "bright_magenta"
+    return Panel(Group(*body), title="🪰  fdd", title_align="left",
+                 border_style=border, box=box.ROUNDED)
+
+
+def _load_reflexes(path):
+    """Read the reflex book that sits beside this brain file."""
+    import json
+
+    from .flybrain import reflex_path
+    from .reflex import ReflexBook
+
+    target = reflex_path(Path(path) if path else None)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ReflexBook(), target
+    return ReflexBook.from_dict(data), target
+
+
+def _save_reflexes(book, target: Path) -> Path:
+    import json
+
+    from .flybrain import _restore_ownership
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(book.as_dict(), indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, target)
+    _restore_ownership(target)
+    return target
+
+
+@fly.group("reflex")
+def fly_reflex():
+    """상태를 보고 명령을 실행하는 반사 — 버섯체의 출력단.
+
+    A mushroom body that only recognises is half a circuit. Its output neurons
+    are premotor: they exist to turn "I know this smell" into "so do this".
+
+    A reflex binds one named state to one command. The fly watches, names the
+    state, and runs what it was taught. It does not write the command — you do,
+    once. What it contributes is deciding *when*.
+
+    Reflexes never fire while the lateral horn is alarming, never fire on an
+    uncertain recognition, fire only on entering a state rather than for as
+    long as it lasts, and do nothing at all until armed.
+    """
+
+
+@fly_reflex.command("teach")
+@click.argument("state")
+@click.argument("command")
+@click.option("--timeout", type=float, default=None,
+              help="Seconds before the command is killed.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_teach(state: State, state_name, command, timeout, path):
+    """STATE 일 때 COMMAND 를 실행하도록 가르친다. 무장은 따로 한다."""
+    from .flybrain import load_brain
+    from .reflex import DEFAULT_TIMEOUT, looks_destructive
+
+    brain = load_brain(Path(path) if path else None)
+    if state_name not in brain.states:
+        known = ", ".join(sorted(brain.states)) or "(없음)"
+        raise click.ClickException(
+            f"'{state_name}' 는 배우지 않은 상태입니다. 아는 상태: {known}\n"
+            f"먼저 가르치세요:  updev fly learn --as {state_name}"
+        )
+
+    book, target = _load_reflexes(path)
+    reflex = book.teach(state_name, command,
+                        timeout=timeout if timeout is not None else DEFAULT_TIMEOUT)
+    _save_reflexes(book, target)
+
+    if state.as_json:
+        state.emit({"reflex": reflex.as_dict(), "path": str(target)})
+        return
+
+    state.console.print(
+        f"[green]'{state_name}' → [/green][bold]{command}[/bold]")
+    warnings = looks_destructive(command)
+    if warnings:
+        state.console.print(Panel(
+            Text("\n".join(warnings) + "\n\n"
+                 "직접 칠 때와 스스로 도는 것은 다릅니다. 무장 전에 다시 보세요.",
+                 style="yellow"),
+            title="주의", title_align="left",
+            border_style="yellow", box=box.ROUNDED))
+    state.console.print(
+        f"[dim]아직 무장되지 않았습니다 — 시험:  updev fly reflex test {state_name}\n"
+        f"무장:  updev fly reflex arm {state_name} --yes[/dim]")
+
+
+# `state` is taken by the State object, so the argument lands under another name.
+fly_reflex_teach.params[0].name = "state_name"
+
+
+@fly_reflex.command("list")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_list(state: State, path):
+    """가르친 반사들."""
+    from .reflex import preview
+
+    book, target = _load_reflexes(path)
+    if state.as_json:
+        state.emit({"reflexes": book.as_dict(), "path": str(target)})
+        return
+
+    if not book.reflexes:
+        state.console.print(Panel(
+            Text("반사가 없습니다.\n\n"
+                 "이름 붙여 가르친 상태에 명령을 묶으면, 날파리가 그 상태에 "
+                 "들어설 때 실행합니다:\n\n"
+                 "  updev fly reflex teach floppy-ejected 'logger 디스켓 빠짐'\n"
+                 "  updev fly reflex arm floppy-ejected --yes", style="dim"),
+            title="🪰  reflex", title_align="left",
+            border_style="dim", box=box.ROUNDED))
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    table.add_column("상태", style="bold", no_wrap=True)
+    table.add_column("무장", no_wrap=True, width=6)
+    table.add_column("명령", overflow="fold", ratio=1)
+    table.add_column("실행", justify="right", no_wrap=True)
+    table.add_column("마지막", no_wrap=True)
+    for reflex in book.reflexes.values():
+        if reflex.last_fired:
+            when = time.strftime("%m-%d %H:%M", time.localtime(reflex.last_fired))
+            when += " ok" if reflex.last_status == 0 else f" rc{reflex.last_status}"
+        else:
+            when = "-"
+        table.add_row(
+            reflex.state,
+            Text("ON" if reflex.armed else "off",
+                 style="bold green" if reflex.armed else "dim"),
+            preview(reflex.command, 80),
+            str(reflex.runs),
+            Text(when, style="dim" if reflex.last_status in (0, None) else "red"),
+        )
+    state.console.print(Panel(table, title="🪰  reflex", title_align="left",
+                              border_style="cyan", box=box.ROUNDED))
+
+
+@fly_reflex.command("arm")
+@click.argument("state_name", metavar="STATE")
+@click.option("--off", is_flag=True, help="Disarm instead.")
+@click.option("--yes", is_flag=True, help="Required — this lets the fly run it unattended.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_arm(state: State, state_name, off, yes, path):
+    """반사를 무장한다. --yes 가 필요하다.
+
+    Teaching a command and letting it run by itself are different decisions,
+    so they are different commands.
+    """
+    from .reflex import looks_destructive
+
+    book, target = _load_reflexes(path)
+    reflex = book.reflexes.get(state_name)
+    if reflex is None:
+        raise click.ClickException(f"그런 반사가 없습니다: {state_name}")
+
+    if not off and not yes:
+        warnings = looks_destructive(reflex.command)
+        state.console.print(Panel(
+            Group(
+                Text(reflex.command, style="bold"),
+                Text("\n이 명령이 앞으로 사람 없이 실행됩니다.", style="yellow"),
+                *([Text("\n" + "\n".join(warnings), style="bright_red")] if warnings else []),
+            ),
+            title="무장 전 확인", title_align="left",
+            border_style="yellow", box=box.ROUNDED))
+        state.console.print(
+            f"[dim]괜찮다면:[/] [bold cyan]updev fly reflex arm {state_name} --yes[/]")
+        raise SystemExit(1)
+
+    book.arm(state_name, on=not off)
+    _save_reflexes(book, target)
+    if state.as_json:
+        state.emit({"reflex": reflex.as_dict()})
+        return
+    if off:
+        state.console.print(f"[dim]'{state_name}' 무장 해제.[/dim]")
+    else:
+        state.console.print(
+            f"[bold green]'{state_name}' 무장됨.[/bold green] "
+            f"[dim]updev fly watch --act 로 돌리면 반응합니다.[/dim]")
+
+
+@fly_reflex.command("test")
+@click.argument("state_name", metavar="STATE")
+@click.option("--run", is_flag=True,
+              help="Actually run it, ignoring whether it is armed.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_test(state: State, state_name, run, path):
+    """반사를 한 번 실행해 본다 — 무장 여부와 무관하게, 지금 이 자리에서."""
+    book, _ = _load_reflexes(path)
+    reflex = book.reflexes.get(state_name)
+    if reflex is None:
+        raise click.ClickException(f"그런 반사가 없습니다: {state_name}")
+
+    if not run:
+        state.console.print(Panel(
+            Text(reflex.command, style="bold"),
+            title=f"'{state_name}' 가 실행할 명령", title_align="left",
+            border_style="cyan", box=box.ROUNDED))
+        state.console.print(
+            f"[dim]실제로 돌려보려면:[/] [bold cyan]updev fly reflex test {state_name} --run[/]")
+        return
+
+    firing = book.run(reflex)
+    _save_reflexes(book, _load_reflexes(path)[1])
+    if state.as_json:
+        state.emit(firing.as_dict())
+        return
+    state.console.print(_firing_panel(firing))
+
+
+@fly_reflex.command("forget")
+@click.argument("state_name", metavar="STATE")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_forget(state: State, state_name, path):
+    """반사를 지운다. 상태 자체는 남는다."""
+    book, target = _load_reflexes(path)
+    if not book.drop(state_name):
+        raise click.ClickException(f"그런 반사가 없습니다: {state_name}")
+    _save_reflexes(book, target)
+    state.console.print(f"[yellow]'{state_name}' 반사를 지웠습니다.[/yellow] "
+                        f"[dim](상태 학습은 그대로)[/dim]")
+
+
+def _firing_panel(firing) -> Panel:
+    reflex = firing.reflex
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("상태", Text(reflex.state, style="bold cyan"))
+    head.add_row("명령", Text(reflex.command, style="bold", overflow="fold"))
+    if firing.ran:
+        head.add_row("결과", Text(
+            f"rc={firing.status}  ({firing.duration:.2f}s)",
+            style="green" if firing.ok else "bright_red"))
+    else:
+        head.add_row("실행 안 함", Text(firing.refused, style="yellow", overflow="fold"))
+
+    body = [head]
+    if firing.stdout:
+        body += [Text("\nstdout", style="dim bold"), Text(firing.stdout)]
+    if firing.stderr:
+        body += [Text("\nstderr", style="dim bold"), Text(firing.stderr, style="red")]
+
+    return Panel(Group(*body), title="🪰  reflex", title_align="left",
+                 border_style="green" if firing.ok else
+                 "yellow" if not firing.ran else "bright_red",
+                 box=box.ROUNDED)
+
+
+@fly.command("brain")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_brain(state: State, path):
+    """회로 구성과 지금까지 학습된 기억."""
+    from .flybrain import (
+        ANTENNAL_LOBE_GLOMERULI,
+        CLAWS_PER_KENYON_CELL,
+        GLOMERULI,
+        KENYON_CELLS,
+        SPARSITY,
+        TAG_BITS,
+        brain_path,
+        load_brain,
+    )
+
+    target = Path(path) if path else brain_path()
+    brain = load_brain(target)
+    stats = brain.stats()
+    if state.as_json:
+        state.emit({"path": str(target), "stats": stats, "glomeruli": list(GLOMERULI)})
+        return
+
+    circuit = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    circuit.add_column("단계", style="bold", no_wrap=True)
+    circuit.add_column("수", justify="right", no_wrap=True)
+    circuit.add_column("하는 일", style="dim", overflow="fold", ratio=1)
+    circuit.add_row("사구체 (촉각엽)", f"{len(GLOMERULI)}",
+                    f"스캔의 특징 하나씩. 실제 초파리도 {ANTENNAL_LOBE_GLOMERULI}개")
+    circuit.add_row("투사뉴런", f"{len(GLOMERULI)}",
+                    "분할 정규화 — 기기 수가 많다고 다 켜지지 않게")
+    circuit.add_row("케니언세포 (버섯체)", f"{KENYON_CELLS:,}",
+                    f"각자 사구체 {CLAWS_PER_KENYON_CELL}개를 무작위로 물고 있음")
+    circuit.add_row("APL 억제뉴런", "1",
+                    f"상위 {SPARSITY:.0%}만 남김 → {TAG_BITS}비트 희소 태그")
+    circuit.add_row("구획", str(len(stats["compartments"])),
+                    "γ·α'β'·αβ — 같은 냄새를 서로 다른 속도로 잊는다")
+    circuit.add_row("MBON", "2", "α'3 = 낯섦, γ1pedc = 위험")
+    circuit.add_row("측면뿔", "—", "학습을 거치지 않는 선천적 경보")
+
+    lobes = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    lobes.add_column("구획", style="bold", no_wrap=True)
+    lobes.add_column("반감기", justify="right", no_wrap=True)
+    lobes.add_column("학습률", justify="right", no_wrap=True)
+    lobes.add_column("세포", justify="right", no_wrap=True)
+    lobes.add_column("남은 기억", justify="right", no_wrap=True)
+    for comp in stats["compartments"]:
+        lobes.add_row(
+            comp["title"],
+            _half_life_label(comp["half_life"]).removeprefix("반감기 "),
+            f"{comp['rate']:.2f}",
+            f"{comp['cells']:,}",
+            Text(f"{comp['retention']:.0%}",
+                 style="green" if comp["retention"] > 0.5 else "dim"),
+        )
+
+    memory = Table.grid(padding=(0, 2))
+    memory.add_column(style="dim", justify="right", no_wrap=True)
+    memory.add_column()
+    memory.add_row("학습 횟수", Text(f"{stats['exposures']}회",
+                                 style="green" if stats["exposures"] else "yellow"))
+    memory.add_row("기억된 세포", Text(
+        f"{stats['cells_touched']:,} / {KENYON_CELLS:,}  ({stats['coverage']:.1%})"))
+    memory.add_row("위험 기억 세포", Text(f"{stats['aversive_cells']:,}"))
+    if stats["states"]:
+        memory.add_row("이름 붙은 상태", Text(
+            ", ".join(f"{n}" for n in stats["states"]), style="cyan"))
+    memory.add_row("파일", Text(str(target), style="dim"))
+    if stats["exposures"]:
+        memory.add_row("마지막 학습", Text(
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(stats["updated"])), style="dim"))
+    if brain.reset_reason:
+        memory.add_row("", Text(brain.reset_reason, style="bright_red", overflow="fold"))
+        if brain.lost_states:
+            memory.add_row("", Text(
+                "다시 가르쳐야 할 상태: "
+                + ", ".join(f"updev fly learn --as {n}" for n in brain.lost_states),
+                style="yellow", overflow="fold"))
+    elif not stats["exposures"]:
+        memory.add_row("", Text("아직 아무것도 모릅니다 — updev fly learn", style="yellow"))
+
+    state.console.print(Panel(Group(circuit, Text(), lobes), title="회로",
+                              title_align="left", border_style="bright_magenta",
+                              box=box.ROUNDED))
+    state.console.print(Panel(memory, title="기억", title_align="left",
+                              border_style="cyan", box=box.ROUNDED))
+
+
+@fly.command("forget")
+@click.option("--yes", is_flag=True, help="Skip the confirmation.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_forget(state: State, yes, path):
+    """학습된 기억을 모두 지운다."""
+    from .flybrain import FlyBrain, brain_path
+
+    target = Path(path) if path else brain_path()
+    if not target.exists():
+        state.console.print(f"[dim]학습된 기억이 없습니다 — {target}[/dim]")
+        return
+    if not yes:
+        click.confirm(f"{target} 의 기억을 지웁니다. 계속할까요?", abort=True)
+    brain = FlyBrain()
+    brain.save(target)
+    state.console.print(f"[yellow]잊었습니다 — 다시 갓 부화한 상태입니다.[/yellow] [dim]{target}[/dim]")
+
+
+# ==========================================================================
+# algo — which algorithms a binary's constants point to
+# ==========================================================================
+
+@cli.command("algo")
+@click.argument("target", type=click.Path(exists=True, dir_okay=False), required=False)
+@click.option("--signatures", is_flag=True, help="Print the rule table and exit.")
+@click.option("--all", "show_all", is_flag=True, help="Include weak findings.")
+@pass_state
+def algo_command(state: State, target, signatures, show_all):
+    """실행 파일의 상수로 알고리즘을 알아낸다.
+
+    Most classic algorithms carry a number nothing else has any reason to
+    contain — 0xEDB88320 is the CRC-32 polynomial, 1103515245 is the ANSI C
+    `rand` multiplier. Finding one is identification, not a guess.
+
+    Two limits, stated because they matter: a constant is evidence rather than
+    proof, and **absence proves nothing** — a table-driven CRC never contains
+    its own polynomial, and a fixed-width ISA splits constants across
+    instructions. Read-only; nothing is executed.
+    """
+    from .algo import SIGNATURES, Strength, analyse, signature_reference
+
+    if signatures:
+        rules = signature_reference()
+        if state.as_json:
+            state.emit({"signatures": rules})
+            return
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+        table.add_column("알고리즘", style="bold", no_wrap=True)
+        table.add_column("세기", no_wrap=True, width=8)
+        table.add_column("표지", overflow="fold", ratio=1, style="dim")
+        for rule in rules:
+            strength = rule["strength"]
+            table.add_row(
+                rule["algorithm"],
+                Text(strength, style="bold green" if strength == "unique" else
+                     "yellow" if strength == "strong" else "dim"),
+                rule["detail"],
+            )
+        state.console.print(Panel(
+            Group(table, Text(
+                "\nunique 는 그 숫자가 다른 뜻을 가질 이유가 없는 것, strong 은 "
+                "우연이기 어려운 것, weak 는 혼자서는 아무 뜻도 없는 것이다.",
+                style="dim italic")),
+            title="시그니처", title_align="left",
+            border_style="bright_magenta", box=box.ROUNDED))
+        return
+
+    if not target:
+        raise click.UsageError("파일을 지정하세요 (또는 --signatures)")
+
+    report = analyse(target)
+    if state.as_json:
+        state.emit(report.as_dict())
+        return
+    if report.error:
+        raise click.ClickException(report.error)
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("파일", Text(report.path, style="bold", overflow="fold"))
+    head.add_row("형식", Text(f"{report.kind} · {report.size:,} 바이트"))
+    if report.stripped is not None:
+        head.add_row("심볼", Text("stripped — 이름 없음" if report.stripped
+                                else "심볼 살아있음",
+                                style="yellow" if report.stripped else "green"))
+
+    body = [head]
+
+    findings = [f for f in report.findings
+                if show_all or f.strength is not Strength.WEAK]
+    hidden = len(report.findings) - len(findings)
+
+    if findings:
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+        table.add_column("알고리즘", style="bold", no_wrap=True)
+        table.add_column("판정", no_wrap=True, width=8)
+        table.add_column("근거", overflow="fold", ratio=1, style="dim")
+        for finding in findings:
+            evidence = "\n".join(
+                f"{e.where}: {e.what}"
+                + (f" @0x{e.offset:X}" if e.offset >= 0 else "")
+                + (f"\n  {e.detail}" if e.detail else "")
+                for e in finding.evidence[:3]
+            )
+            table.add_row(
+                Text(finding.label, style="bold"),
+                Text(str(finding.strength),
+                     style="bold green" if finding.certain else "yellow"),
+                evidence,
+            )
+        body += [Text("\n찾은 것", style="bold"), table]
+    else:
+        body.append(Text("\n알려진 시그니처가 없습니다.", style="yellow"))
+
+    if hidden:
+        body.append(Text(f"\nweak 근거 {hidden}개는 숨겼습니다 — --all 로 보기",
+                         style="dim italic"))
+
+    body.append(Text(
+        "\n없다고 나온 것이 없다는 증거는 아닙니다 — 테이블로 펼친 CRC 는 "
+        "다항식을 담지 않고, 고정폭 ISA 는 상수를 명령어에 쪼개 넣습니다.",
+        style="dim italic"))
+
+    state.console.print(Panel(
+        Group(*body), title="🔍  algo", title_align="left",
+        border_style="cyan" if findings else "yellow", box=box.ROUNDED))
+
+
+# ==========================================================================
 # tools — what to run on whatever is attached
 # ==========================================================================
 
