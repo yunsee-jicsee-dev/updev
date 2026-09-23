@@ -29,6 +29,30 @@ from .ui.dash import Dashboard
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
 
+class DeviceFirstGroup(click.Group):
+    """Also accept `updev <device> <verb>`, not just `updev <verb> <device>`.
+
+    Typing the thing you are holding before the thing you want to do to it is
+    how people describe it out loud ("this floppy drive — open its editor"),
+    and the rewrite is unambiguous: it only fires when the first word is not a
+    command and the second one is a verb that takes a device.
+    """
+
+    #: Verbs whose first argument is a device.
+    DEVICE_VERBS = frozenset({"gui", "tools", "show"})
+
+    def resolve_command(self, ctx, args):
+        if (
+            len(args) >= 2
+            and args[0] not in self.commands
+            and not args[0].startswith("-")
+            and args[1] in self.DEVICE_VERBS
+        ):
+            command = self.commands[args[1]]
+            return args[1], command, [args[0], *args[2:]]
+        return super().resolve_command(ctx, args)
+
+
 class State:
     """Shared plumbing hung off the click context."""
 
@@ -58,7 +82,8 @@ pass_state = click.make_pass_decorator(State, ensure=True)
 # root
 # ==========================================================================
 
-@click.group(context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
+@click.group(cls=DeviceFirstGroup, context_settings=CONTEXT_SETTINGS,
+             invoke_without_command=True)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option("--no-color", is_flag=True, help="Disable ANSI colour.")
 @click.option("--deep", is_flag=True, help="Slower, more thorough probing (bus scans, LAN sweep).")
@@ -74,8 +99,11 @@ pass_state = click.make_pass_decorator(State, ensure=True)
 def cli(ctx, as_json, no_color, deep, timeout, backends, excluded, width):
     """updev — one device manager for the whole board.
 
-    LAN, USB, I2C, SPI, serial, cameras, GPIO, storage, Bluetooth and the
+    LAN, USB, I2C, SPI, serial, cameras, GPIO, storage, Bluetooth, NFC and the
     Raspberry Pi itself, in one place.
+
+    A device can come first: `updev 3-2 gui`, `updev sda tools`, `updev eth0
+    show` all work, as does the usual `updev gui 3-2`.
     """
     state = State()
     state.console = render.make_console(no_color=no_color, width=width)
@@ -279,6 +307,28 @@ def show(state: State, query):
         return
     for dev in matches:
         state.console.print(render.device_detail(dev))
+        _print_tools(state, dev)
+
+
+def _print_tools(state: State, dev) -> None:
+    """The tools that fit this device, under its detail panel.
+
+    Only for the kinds where `toolkit` knows more than the backend already
+    said — a USB device's tools come from its role and storage class, which
+    the backend never computed.
+    """
+    if dev.kind != Kind.USB or "root-hub" in dev.tags:
+        return
+    from .toolkit import annotate, recognize
+    from .ui.zone import tool_lines
+
+    recognition = recognize(dev)
+    annotate(recognition.tools)
+    if not recognition.tools:
+        return
+    state.console.print(Text("  할 수 있는 것", style="bold dim"))
+    state.console.print(tool_lines(recognition.tools))
+    state.console.print()
 
 
 @cli.command()
@@ -424,13 +474,17 @@ def usb():
               help="Seconds between polls.")
 @click.option("--existing", is_flag=True,
               help="Also classify whatever is already plugged in.")
+@click.option("--storage-only", is_flag=True,
+              help="Only react to mass storage, as the zone used to.")
 @click.option("-n", "--iterations", type=int, default=None, hidden=True)
 @pass_state
-def usb_zone(state: State, interval, existing, iterations):
-    """USB 체험존 — plug a device in and watch it get identified.
+def usb_zone(state: State, interval, existing, storage_only, iterations):
+    """USB 체험존 — plug anything in and watch it get identified.
 
-    Shows the class, the confidence, and every signature that went into the
-    decision, so a surprising answer can be argued with.
+    Shows what it is, every signature that went into that decision so a
+    surprising answer can be argued with, and the tools that fit it: a floppy
+    drive gets `updev floppy`, a camera gets camtoy, a keyboard gets an evdev
+    tap. Storage is classified by signature; everything else by role.
     """
     if state.as_json:
         raise click.UsageError("--json cannot be combined with zone; use `updev usb classify`")
@@ -439,7 +493,8 @@ def usb_zone(state: State, interval, existing, iterations):
     ctx = state.ctx
     if not ctx.include:
         ctx.include = FAST_BACKENDS
-    UsbZone(state.scanner, ctx, state.console, interval=interval).run(
+    UsbZone(state.scanner, ctx, state.console, interval=interval,
+            storage_only=storage_only).run(
         iterations=iterations, include_existing=existing
     )
 
@@ -1238,6 +1293,695 @@ def floppy_info(state: State, image):
 
 
 # ==========================================================================
+# tools — what to run on whatever is attached
+# ==========================================================================
+
+@cli.command("tools")
+@click.argument("target", required=False)
+@click.option("--brief", is_flag=True, help="One line per tool.")
+@pass_state
+def tools_command(state: State, target, brief):
+    """뭘 꽂았든, 그걸로 할 수 있는 것.
+
+    `updev usb zone` without the live screen. Identifies what is attached —
+    storage by signature, everything else by role — and lists the commands
+    that fit it. A USB floppy gets `updev floppy`; a thumb drive gets a read
+    benchmark; a keyboard gets an evdev tap; a wired NFC module gets the
+    reader.
+
+    TARGET is anything `updev show` accepts. Omit it for everything attached.
+    """
+    from .toolkit import annotate, recognize
+    from .ui.zone import tool_lines, tools_panel
+
+    result = state.scan()
+    if target:
+        devices = result.find(target)
+        if not devices:
+            state.console.print(f"[red]nothing matches[/] [bold]{target}[/]")
+            state.console.print("[dim]run[/] [bold cyan]updev scan[/] [dim]to list devices[/]")
+            raise SystemExit(1)
+    else:
+        devices = [
+            d for d in result.devices
+            if (d.kind == Kind.USB and "root-hub" not in d.tags)
+            or d.kind == Kind.NFC
+            or (d.kind == Kind.CAMERA and d.node)
+        ]
+
+    recognitions = []
+    for dev in devices:
+        recognition = recognize(dev)
+        annotate(recognition.tools)
+        recognitions.append(recognition)
+
+    if state.as_json:
+        state.emit({"devices": [r.as_dict() for r in recognitions]})
+        return
+
+    if not recognitions:
+        state.console.print("[yellow]nothing attached that updev has a tool for[/]")
+        state.console.print("[dim]plug something in, or run[/] "
+                            "[bold cyan]updev nfc wiring[/] [dim]to wire a reader[/]")
+        return
+
+    for recognition in recognitions:
+        dev = recognition.device
+        title = Text()
+        title.append(f" {recognition.badge} ", style="bold black on bright_yellow")
+        title.append(f"  {dev.label}", style="bold")
+        title.append(f"   {recognition.headline}", style="dim")
+        if brief:
+            state.console.print(title)
+            state.console.print(tool_lines(recognition.tools))
+            state.console.print()
+        else:
+            state.console.print(tools_panel(recognition, title=str(title.plain).strip()))
+
+
+
+# ==========================================================================
+# gui
+# ==========================================================================
+
+@cli.command("gui")
+@click.argument("target", required=False)
+@pass_state
+def gui_command(state: State, target):
+    """장치별 에디터 GUI — 꽂힌 것마다 그에 맞는 편집기.
+
+    TARGET is anything `updev show` accepts; omit it to browse everything.
+    `updev 3-2 gui` works too.
+
+    Plain tkinter, so there is nothing to install on Raspberry Pi OS. A USB
+    floppy gets the FAT12 editor, an NFC reader gets the tag editor, an I2C
+    chip gets its register space, a keyboard gets its event stream — and
+    anything else at least gets its full detail and the commands that fit it.
+    """
+    from .gui import available, launch
+
+    if state.as_json:
+        raise click.UsageError("--json cannot be combined with gui")
+
+    ok, why = available()
+    if not ok:
+        state.console.print(f"[red]GUI를 열 수 없습니다[/] — {why}")
+        state.console.print("[dim]터미널에서 같은 걸 보려면:[/] "
+                            "[bold cyan]updev tools[/]")
+        raise SystemExit(1)
+
+    result = state.scan()
+    launch(result, target=target or "", deep=state.ctx.deep)
+
+
+# ==========================================================================
+# disk — read-only measurement
+# ==========================================================================
+
+@cli.group()
+def disk():
+    """Measure a block device. Reads only — nothing here opens for writing."""
+
+
+@disk.command("bench")
+@click.argument("target")
+@click.option("--chunk", type=int, default=4, show_default=True,
+              help="MiB per sequential read.")
+@click.option("-n", "--reads", type=int, default=8, show_default=True,
+              help="How many sequential chunks.")
+@click.option("--seeks", type=int, default=48, show_default=True,
+              help="Random reads for the latency probe (0 skips it).")
+@click.option("--buffered", is_flag=True,
+              help="Skip O_DIRECT; drop the cache before each read instead.")
+@pass_state
+def disk_bench(state: State, target, chunk, reads, seeks, buffered):
+    """실제 읽기 속도 · 랜덤 접근 지연 — 링크 속도가 아니라 매체의 속도.
+
+    TARGET is a device node (/dev/sda) or a name updev knows (sda, the model).
+
+    The seek probe is the interesting half: `updev usb classify` decides HUSB
+    against SUSB from the drive's own VPD 0xB1 claim, and a median random read
+    latency either backs that up or catches the bridge lying.
+    """
+    from .bench import link_comparison, rotation_hint, run
+    from .core.util import human_bytes, usb_address_from_path
+
+    node = _resolve_block(state, target)
+    try:
+        result = run(node, chunk_mb=chunk, reads=reads, seeks=max(0, seeks),
+                     direct=not buffered)
+    except PermissionError:
+        state.console.print(f"[red]no read access to[/] [bold]{node}[/]")
+        state.console.print(f"[dim]raw sectors are root:disk. Either:[/] "
+                            f"[bold cyan]sudo updev disk bench {node}[/]")
+        state.console.print("[dim]or a udev rule scoped to this one device. Not the "
+                            "disk group — it hands over raw read/write on every "
+                            "block device, which is root by another name.[/]")
+        raise SystemExit(1)
+    except OSError as e:
+        state.console.print(f"[red]{node}: {e.strerror or e}[/]")
+        raise SystemExit(1)
+
+    payload = result.as_dict()
+
+    # Cross-checks: the negotiated link, and what the classifier decided.
+    name = Path(node).name
+    link_mbps = 0.0
+    address = ""
+    try:
+        real = str(Path(f"/sys/block/{name}").resolve())
+        address = usb_address_from_path(real)
+    except OSError:
+        pass
+    if address:
+        from .usbrole import build_path
+        for hop in build_path(address):
+            if hop.is_target:
+                link_mbps = float(hop.speed or 0)
+    payload["link_mbps"] = link_mbps
+    payload["usb_address"] = address
+
+    verdict = None
+    if address:
+        from .usbclass import UsbClass, classify, gather_facts
+        verdict = classify(gather_facts(usb_address=address))
+        payload["classifier"] = str(verdict.usb_class)
+
+    if state.as_json:
+        state.emit(payload)
+        return
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True, min_width=18)
+    head.add_column(overflow="fold")
+    head.add_row("device", Text(f"{node}   {human_bytes(result.size_bytes)}", style="bold"))
+    head.add_row("sequential read",
+                 Text(f"{result.throughput_mbs:.1f} MB/s", style="bold bright_green")
+                 .append(f"   (median chunk {result.steady_mbs:.1f} MB/s, "
+                         f"{result.reads} × {result.chunk_bytes // (1024 * 1024)} MiB)",
+                         style="dim"))
+    if link_mbps:
+        head.add_row("versus the link", Text(link_comparison(result.throughput_mbs, link_mbps)))
+    if result.seek_ms:
+        spin, reason = rotation_hint(result.seek_median)
+        line = Text(f"{result.seek_median:.2f} ms", style="bold")
+        line.append(f"   → {spin}", style="bold cyan")
+        head.add_row("random read (median)", line)
+        head.add_row("", Text(reason, style="dim italic"))
+    head.add_row("io", Text("O_DIRECT" if result.direct else "buffered, cache dropped",
+                            style="dim"))
+    if result.note:
+        head.add_row("", Text(result.note, style="dim"))
+
+    body = [head]
+    if verdict is not None:
+        from .usbclass import UsbClass
+        spin, _ = rotation_hint(result.seek_median)
+        expected = {UsbClass.HUSB: "rotating", UsbClass.SUSB: "solid-state",
+                    UsbClass.NUSB: "solid-state"}.get(verdict.usb_class)
+        if expected and spin in ("rotating", "solid-state"):
+            agree = expected == spin
+            note = Text("\n  ")
+            note.append("분류기와 실측: ", style="bold dim")
+            note.append(f"{verdict.usb_class} ", style="bold")
+            note.append("says " + expected, style="dim")
+            note.append("  ·  measured " + spin, style="dim")
+            note.append("   일치" if agree else "   불일치", 
+                        style="bold green" if agree else "bold red")
+            body.append(note)
+            if not agree:
+                body.append(Text(
+                    "  the two disagree, and the measurement is the one that "
+                    "touched the medium — a bridge that misreports VPD 0xB1 is "
+                    "exactly the failure this probe exists to catch.",
+                    style="dim italic"))
+
+    state.console.print(Panel(Group(*body), title="disk bench", title_align="left",
+                              border_style="bright_green", box=box.ROUNDED))
+
+
+def _resolve_block(state: State, target: str) -> str:
+    """A node path, a bare name, an image file, or anything `updev show` matches."""
+    want = target.strip()
+    if Path(want).is_file() or (want.startswith("/dev/") and Path(want).exists()):
+        return want
+    if Path(f"/dev/{want}").exists():
+        return f"/dev/{want}"
+    result = state.scan(include=frozenset({"storage"}))
+    for dev in result.find(want):
+        if dev.node:
+            return dev.node
+    state.console.print(f"[red]no block device matches[/] [bold]{target}[/]")
+    state.console.print("[dim]run[/] [bold cyan]updev scan -k storage[/]")
+    raise SystemExit(1)
+
+
+# ==========================================================================
+# hid — what the keyboard is actually sending
+# ==========================================================================
+
+@cli.group()
+def hid():
+    """Keyboards, mice, gamepads — the events, as the kernel decoded them."""
+
+
+@hid.command("list")
+@pass_state
+def hid_list(state: State):
+    """Every input device with an event node."""
+    from .hid import event_nodes
+
+    root = Path("/sys/class/input")
+    rows = []
+    for entry in sorted(root.glob("input*")) if root.is_dir() else []:
+        for node in event_nodes(entry):
+            rows.append(node)
+
+    if state.as_json:
+        state.emit({"devices": [n.as_dict() for n in rows]})
+        return
+    if not rows:
+        state.console.print("[yellow]no input devices[/]")
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+    table.add_column("node", style="bold")
+    table.add_column("name")
+    table.add_column("emits", style="dim")
+    table.add_column("access", style="dim")
+    for node in rows:
+        table.add_row(node.path, node.name, ", ".join(node.capabilities) or "—",
+                      "readable" if node.readable else "no access")
+    state.console.print(table)
+
+
+@hid.command("watch")
+@click.argument("target")
+@click.option("-d", "--duration", type=float, default=0.0,
+              help="Stop after this many seconds.")
+@click.option("-n", "--limit", type=int, default=0, help="Stop after this many events.")
+@click.option("--all-events", is_flag=True,
+              help="Include the SYN/MSC framing events too.")
+@pass_state
+def hid_watch(state: State, target, duration, limit, all_events):
+    """키보드·마우스가 실제로 보내는 이벤트를 그대로.
+
+    TARGET is a USB address (1-2.2), an input directory (input29), an event
+    node (event5) or part of the device's name. A composite receiver is
+    several event nodes and all of them are watched.
+
+    Reading a keyboard's event node means reading everything typed on it,
+    passwords included — which is why the target is required and why this
+    prints what it opened before it starts.
+    """
+    from .hid import describe, resolve, watch
+
+    nodes = resolve(target)
+    if not nodes:
+        state.console.print(f"[red]no input device matches[/] [bold]{target}[/]")
+        state.console.print("[dim]run[/] [bold cyan]updev hid list[/]")
+        raise SystemExit(1)
+
+    blocked = [n for n in nodes if not n.readable]
+    if blocked and len(blocked) == len(nodes):
+        state.console.print(f"[red]no read access to[/] {', '.join(n.path for n in blocked)}")
+        state.console.print("[dim]add yourself to the input group:[/] "
+                            "[bold cyan]sudo usermod -aG input $USER[/]"
+                            "[dim]   (then log out and back in)[/]")
+        raise SystemExit(1)
+
+    readable_nodes = [n for n in nodes if n.readable]
+    if not state.as_json:
+        for node in readable_nodes:
+            state.console.print(Text("watching ", style="dim")
+                                .append(node.path, style="bold")
+                                .append(f"   {node.name}", style="dim"))
+        if any("keys" in n.capabilities for n in readable_nodes):
+            state.console.print(Text(
+                "이 장치는 키 입력을 보냅니다 — 여기 찍히는 건 실제로 입력되는 "
+                "내용입니다.", style="yellow"))
+        state.console.print(Text("ctrl-c 로 종료", style="dim italic"))
+
+    count = 0
+    try:
+        for node, event in watch(readable_nodes, duration=duration, quiet=not all_events):
+            count += 1
+            if state.as_json:
+                click.echo(json.dumps({"node": node.path, **event.as_dict()},
+                                      ensure_ascii=False), nl=True)
+            else:
+                line = Text(time.strftime("%H:%M:%S "), style="dim")
+                line.append(f"{Path(node.path).name:<8}", style="dim")
+                line.append(describe(event),
+                            style="bold" if event.type == 0x01 else "")
+                state.console.print(line)
+            if limit and count >= limit:
+                break
+    except KeyboardInterrupt:
+        pass
+    if not state.as_json:
+        state.console.print(Text(f"\n{count} event(s)", style="dim"))
+
+
+# ==========================================================================
+# nfc — readers on jumper wires
+# ==========================================================================
+
+@cli.group()
+def nfc():
+    """NFC readers wired to the 40-pin header: MFRC522 and PN532.
+
+    These modules cannot announce themselves — SPI has no enumeration and I2C
+    has one fixed address — so start with `updev nfc wiring`, wire it, then
+    `updev nfc detect`.
+    """
+
+
+@nfc.command("wiring")
+@click.argument("module", required=False)
+@pass_state
+def nfc_wiring(state: State, module):
+    """점퍼선 배선표 — 어느 핀에 뭘 꽂는지.
+
+    MODULE picks one entry (rc522, spi, i2c, uart); omit it for all of them.
+    """
+    from .backends.nfc import missing_buses
+    from .nfc import WIRINGS, wiring_for
+
+    wanted = [wiring_for(module)] if module else list(WIRINGS)
+    if module and wanted[0] is None:
+        state.console.print(f"[red]no wiring for[/] [bold]{module}[/]")
+        state.console.print("[dim]try: rc522, spi, i2c, uart[/]")
+        raise SystemExit(1)
+
+    if state.as_json:
+        state.emit({
+            "wirings": [w.as_dict() for w in wanted],
+            "missing_buses": [{"bus": b, "enable": fix} for b, fix in missing_buses()],
+        })
+        return
+
+    for wiring in wanted:
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        table.add_column("모듈 핀", style="bold")
+        table.add_column("", style="dim", justify="center")
+        table.add_column("40핀 헤더", justify="right", style="bold bright_yellow")
+        table.add_column("파이 쪽 이름", style="dim")
+        for name, pin, pi_name in wiring.wires:
+            table.add_row(name, "→", f"pin {pin}", pi_name)
+        body = Group(
+            table,
+            Text(),
+            Text(wiring.note, style="dim italic"),
+            Text("\n확인 방법  ", style="dim").append(wiring.probe, style="cyan"),
+        )
+        state.console.print(Panel(
+            body, title=f"{wiring.module}   [{wiring.bus}]", title_align="left",
+            border_style="bright_red", box=box.ROUNDED,
+        ))
+
+    for bus, fix in missing_buses():
+        state.console.print(Text(f"\n{bus.upper()} 가 꺼져 있습니다 — ", style="yellow")
+                            .append("배선해도 아무것도 안 보입니다.", style="yellow dim"))
+        state.console.print(Text("  $ ", style="dim").append(fix, style="bold cyan"))
+
+    state.console.print(Text("\n배선 끝났으면  ", style="dim")
+                        .append("updev nfc detect", style="bold cyan"))
+
+
+@nfc.command("detect")
+@click.option("-v", "--verbose", is_flag=True, help="Show the buses that stayed silent.")
+@click.option("--uart", is_flag=True,
+              help="Also probe /dev/serial0 (off by default — the console usually owns it).")
+@click.option("--no-spi", is_flag=True, help="Skip SPI; I2C only.")
+@pass_state
+def nfc_detect(state: State, verbose, uart, no_spi):
+    """리더가 붙어있는지 물어본다 — SPI·I2C(·UART)를 차례로.
+
+    SPI has no addressing, so this clocks a register read out to whatever is
+    on each chip-select. That is safe for an RC522 or a PN532 and harmless for
+    most things, but it is why the scan backend won't do it without --deep.
+    """
+    from .backends.nfc import probe_all
+
+    readers = probe_all(spi=not no_spi, i2c=True, uart=uart)
+    found = [r for r in readers if r.found]
+
+    if state.as_json:
+        state.emit({"readers": [r.as_dict() for r in readers],
+                    "found": len(found)})
+        return
+
+    for reader in found:
+        body = Table.grid(padding=(0, 2))
+        body.add_column(style="dim", justify="right", no_wrap=True, min_width=10)
+        body.add_column(overflow="fold")
+        body.add_row("module", Text(reader.module, style="bold"))
+        body.add_row("transport", reader.transport)
+        body.add_row("where", reader.where)
+        body.add_row("firmware", Text(reader.detail, style="bright_green"))
+        state.console.print(Panel(body, title="찾음", title_align="left",
+                                  border_style="bright_green", box=box.ROUNDED))
+
+    if not found:
+        state.console.print("[yellow]아무 리더도 대답하지 않았습니다[/]")
+        state.console.print("[dim]배선표:[/] [bold cyan]updev nfc wiring[/]")
+
+    if verbose or not found:
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        table.add_column("probed", style="bold")
+        table.add_column("result")
+        for reader in readers:
+            table.add_row(
+                f"{reader.module} · {reader.where}",
+                Text("found", style="green") if reader.found
+                else Text(reader.error or "no answer", style="dim"),
+            )
+        state.console.print(table)
+
+    if found:
+        state.console.print(Text("\n태그 올려보기  ", style="dim")
+                            .append("updev nfc poll", style="bold cyan"))
+
+
+@nfc.command("read")
+@click.option("-t", "--timeout", type=float, default=8.0, show_default=True,
+              help="Seconds to wait for a tag.")
+@click.option("--uart", is_flag=True, help="Include the UART reader in the search.")
+@pass_state
+def nfc_read(state: State, timeout, uart):
+    """태그 하나 읽기 — UID·ATQA·SAK 와 그게 무슨 카드인지."""
+    from .nfc import atqa_describe
+
+    chip, close, reader = _open_nfc(state, uart=uart)
+    try:
+        tag = _wait_for_tag(state, chip, timeout)
+    finally:
+        close()
+
+    if tag is None:
+        if state.as_json:
+            state.emit({"tag": None, "reader": reader.where})
+        else:
+            state.console.print(f"[yellow]{timeout:.0f}초 동안 태그가 없었습니다[/]")
+        raise SystemExit(1)
+
+    if state.as_json:
+        state.emit({"tag": tag.as_dict(), "reader": reader.where})
+        return
+
+    body = Table.grid(padding=(0, 2))
+    body.add_column(style="dim", justify="right", no_wrap=True, min_width=8)
+    body.add_column(overflow="fold")
+    body.add_row("UID", Text(tag.uid_hex, style="bold bright_green"))
+    body.add_row("kind", Text(tag.kind, style="bold"))
+    if tag.atqa:
+        body.add_row("ATQA", atqa_describe(tag.atqa))
+    if tag.sak >= 0:
+        body.add_row("SAK", f"0x{tag.sak:02x}")
+    body.add_row("reader", tag.reader)
+    state.console.print(Panel(body, title="태그", title_align="left",
+                              border_style="bright_green", box=box.ROUNDED))
+    if tag.sak in (0x08, 0x09, 0x18, 0x19):
+        state.console.print(Text("MIFARE Classic — 섹터 덤프:  ", style="dim")
+                            .append("updev nfc dump --sector 1", style="bold cyan"))
+
+
+@nfc.command("poll")
+@click.option("-d", "--duration", type=float, default=0.0,
+              help="Stop after this many seconds.")
+@click.option("-n", "--limit", type=int, default=0, help="Stop after this many tags.")
+@click.option("--repeat", is_flag=True, help="Report a tag every pass, not just on change.")
+@click.option("--uart", is_flag=True, help="Include the UART reader in the search.")
+@pass_state
+def nfc_poll(state: State, duration, limit, repeat, uart):
+    """태그를 계속 기다린다 — 올릴 때마다 한 줄.
+
+    The NFC counterpart of `updev usb zone`: hold a card on the reader and it
+    says what it is.
+    """
+    from .nfc import NfcError
+
+    chip, close, reader = _open_nfc(state, uart=uart)
+    if not state.as_json:
+        state.console.print(Text("태그를 리더에 올리세요 — ", style="bold")
+                            .append(f"{reader.module} · {reader.where}", style="dim"))
+        state.console.print(Text("ctrl-c 로 종료", style="dim italic"))
+
+    seen = ""
+    count = 0
+    deadline = time.time() + duration if duration else None
+    try:
+        while deadline is None or time.time() < deadline:
+            try:
+                tag = chip.poll()
+            except NfcError:
+                seen = ""
+                time.sleep(0.15)
+                continue
+            if tag.uid_hex != seen or repeat:
+                seen = tag.uid_hex
+                count += 1
+                if state.as_json:
+                    click.echo(json.dumps(tag.as_dict(), ensure_ascii=False))
+                else:
+                    line = Text(time.strftime("%H:%M:%S "), style="dim")
+                    line.append(tag.uid_hex, style="bold bright_green")
+                    line.append(f"   {tag.kind}", style="dim")
+                    state.console.print(line)
+                if limit and count >= limit:
+                    break
+            time.sleep(0.15)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        close()
+    if not state.as_json:
+        state.console.print(Text(f"\n{count} tag(s)", style="dim"))
+
+
+@nfc.command("dump")
+@click.option("-s", "--sector", type=int, default=1, show_default=True,
+              help="MIFARE Classic sector to read.")
+@click.option("--key", default="FFFFFFFFFFFF", show_default=True,
+              help="6-byte key A, as hex.")
+@click.option("-t", "--timeout", type=float, default=8.0, show_default=True)
+@click.option("--uart", is_flag=True, help="Include the UART reader in the search.")
+@pass_state
+def nfc_dump(state: State, sector, key, timeout, uart):
+    """MIFARE Classic 한 섹터를 읽는다 (읽기 전용).
+
+    Blocks are read, never written. The default key is the factory
+    FFFFFFFFFFFF, which is what an unwritten card ships with; a keyed card
+    fails authentication and says so rather than guessing.
+    """
+    from .nfc import (
+        Mfrc522,
+        NfcError,
+        ascii_dump,
+        describe_block,
+        hexdump,
+        sector_blocks,
+    )
+
+    try:
+        key_bytes = bytes.fromhex(key.replace(":", "").replace(" ", ""))
+    except ValueError:
+        raise click.UsageError(f"--key must be hex, got {key!r}")
+    if len(key_bytes) != 6:
+        raise click.UsageError(f"--key must be 6 bytes, got {len(key_bytes)}")
+    if sector < 0 or sector > 39:
+        raise click.UsageError("MIFARE Classic has sectors 0-39")
+
+    chip, close, reader = _open_nfc(state, uart=uart)
+    rows = []
+    try:
+        tag = _wait_for_tag(state, chip, timeout)
+        if tag is None:
+            if state.as_json:
+                state.emit({"tag": None})
+            else:
+                state.console.print(f"[yellow]{timeout:.0f}초 동안 태그가 없었습니다[/]")
+            raise SystemExit(1)
+
+        for block in sector_blocks(sector):
+            try:
+                if isinstance(chip, Mfrc522):
+                    chip.authenticate(block, tag.uid, key_bytes)
+                    data = chip.read_block(block)
+                else:
+                    data = chip.read_block(block, tag.uid, key_bytes)
+                rows.append((block, data, ""))
+            except NfcError as e:
+                rows.append((block, b"", str(e)))
+        if isinstance(chip, Mfrc522):
+            chip.stop_crypto()
+            chip.halt()
+    finally:
+        close()
+
+    if state.as_json:
+        state.emit({
+            "tag": tag.as_dict(),
+            "sector": sector,
+            "blocks": [
+                {"block": b, "hex": hexdump(d), "ascii": ascii_dump(d),
+                 "role": describe_block(b, d), "error": err}
+                for b, d, err in rows
+            ],
+        })
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+    table.add_column("blk", justify="right", style="dim")
+    table.add_column("16 bytes", style="bold")
+    table.add_column("ascii")
+    table.add_column("", style="dim")
+    for block, data, error in rows:
+        if error:
+            table.add_row(str(block), Text(error, style="red"), "", "")
+            continue
+        table.add_row(str(block), hexdump(data), ascii_dump(data),
+                      describe_block(block, data))
+    state.console.print(Panel(
+        table, title=f"sector {sector}   ·   UID {tag.uid_hex}   ·   {tag.kind}",
+        title_align="left", border_style="bright_red", box=box.ROUNDED,
+    ))
+
+
+def _open_nfc(state: State, uart: bool = False):
+    """Find a reader and open it, or explain what to check. (chip, close, reader)."""
+    from .backends.nfc import open_reader, probe_all
+
+    readers = [r for r in probe_all(spi=True, i2c=True, uart=uart) if r.found]
+    if not readers:
+        state.console.print("[red]리더를 찾지 못했습니다[/]")
+        state.console.print("[dim]배선 확인:[/] [bold cyan]updev nfc wiring[/]"
+                            "[dim]   ·   자세히:[/] [bold cyan]updev nfc detect -v[/]")
+        raise SystemExit(1)
+    reader = readers[0]
+    try:
+        chip, close = open_reader(reader)
+    except OSError as e:
+        state.console.print(f"[red]{reader.where}: {e.strerror or e}[/]")
+        raise SystemExit(1)
+    return chip, close, reader
+
+
+def _wait_for_tag(state: State, chip, timeout: float):
+    """Poll until a tag answers or the clock runs out."""
+    from .nfc import NfcError
+
+    deadline = time.time() + max(0.1, timeout)
+    while time.time() < deadline:
+        try:
+            return chip.poll()
+        except NfcError:
+            time.sleep(0.15)
+    return None
+
+
+# ==========================================================================
 # I2C
 # ==========================================================================
 
@@ -1984,6 +2728,151 @@ def power(state: State):
         state.emit(dev.as_dict())
         return
     state.console.print(render.device_detail(dev))
+
+
+# ==========================================================================
+# panel — the ST7735S front panel
+# ==========================================================================
+
+_PANEL_WIRING = """[dim]VCC[/]→3V3  [dim]GND[/]→GND  [dim]SCL[/]→GPIO11  [dim]SDA[/]→GPIO10
+[dim]RES[/]→GPIO25  [dim]DC[/]→GPIO24  [dim]CS[/]→GPIO8 (CE0)  [dim]BLK[/]→3V3"""
+
+
+def _panel_options(f):
+    """Wiring flags shared by every panel subcommand."""
+    for option in reversed([
+        click.option("--spi", "target", default="0.0", show_default=True,
+                     metavar="BUS.CS", help="Which spidev node the panel is on."),
+        click.option("--dc", type=int, default=24, show_default=True,
+                     help="BCM pin wired to DC."),
+        click.option("--rst", type=int, default=25, show_default=True,
+                     help="BCM pin wired to RES."),
+        click.option("--backlight", type=int, default=None,
+                     help="BCM pin wired to BLK, if you drive it."),
+        click.option("--speed", type=int, default=8_000_000, show_default=True,
+                     help="SPI clock in Hz."),
+        click.option("--bgr", is_flag=True,
+                     help="Swap red and blue — some ST7735S panels are wired BGR."),
+        click.option("--capture", type=click.Path(file_okay=False), default=None,
+                     help="Also save every frame here as PNG."),
+    ]):
+        f = option(f)
+    return f
+
+
+def _open_panel(state: State, target, dc, rst, backlight, speed, bgr, capture,
+                required: bool = True):
+    from .panel import PanelUnavailable, open_panel
+
+    port, cs = _parse_spi_target(target)
+    try:
+        screen = open_panel(port=port, cs=cs, dc=dc, rst=rst, backlight=backlight,
+                            speed_hz=speed, bgr=bgr,
+                            capture=Path(capture) if capture else None,
+                            required=required)
+    except PanelUnavailable as e:
+        state.console.print(f"[red]no panel:[/] {e}")
+        state.console.print(Panel(_PANEL_WIRING, title="expected wiring",
+                                  title_align="left", border_style="dim",
+                                  box=box.ROUNDED))
+        raise SystemExit(1) from e
+    if not screen.live:
+        state.console.print("[yellow]no panel — drawing to memory only[/]")
+    return screen
+
+
+@cli.group()
+def panel():
+    """The ST7735S front panel: what the board is doing, on the glass.
+
+    A 128x160 SPI display showing the same scan the CLI and GUI show. `updev
+    panel boot` is meant to run at startup — it leaves its summary on screen
+    after it exits, so the panel keeps reading as a status display with
+    nothing running.
+    """
+
+
+@panel.command("boot")
+@_panel_options
+@click.option("--splash", type=float, default=0.8, show_default=True,
+              help="Minimum seconds to hold the splash before progress rows.")
+@click.option("--hold", type=float, default=0.0,
+              help="Seconds to sit on the summary before exiting.")
+@click.option("--blank", is_flag=True,
+              help="Clear the panel on exit instead of leaving the summary up.")
+@pass_state
+def panel_boot(state: State, target, dc, rst, backlight, speed, bgr, capture,
+               splash, hold, blank):
+    """Boot screen: splash, live backend progress, then the summary.
+
+    The progress rows are the useful part — each backend ticks over as its
+    report lands, so a bus that hangs is named on screen instead of showing up
+    as a display that never changes.
+    """
+    from .panel import boot as run_boot
+
+    screen = _open_panel(state, target, dc, rst, backlight, speed, bgr, capture)
+    try:
+        result = run_boot(screen, state.scanner, state.ctx,
+                          splash_s=splash, hold_s=hold)
+    finally:
+        screen.close(blank=blank)
+
+    if state.as_json:
+        state.emit(result.as_dict())
+        return
+    ok = sum(1 for r in result.reports if r.available and r.ok)
+    state.console.print(
+        f"[green]panel[/] {len(result.devices)} devices · "
+        f"{ok}/{len(result.reports)} backends · {result.duration:.1f}s"
+        + ("" if blank else " [dim](summary left on screen)[/]")
+    )
+
+
+@panel.command("test")
+@_panel_options
+@pass_state
+def panel_test(state: State, target, dc, rst, backlight, speed, bgr, capture):
+    """Colour bars and a pixel grid — is it wired right, and is it BGR?
+
+    If the bars read blue-green-red instead of red-green-blue, the panel is
+    BGR: re-run with `--bgr`.
+    """
+    from .panel.screen import ACCENT, BLACK, DIM, FG, WIDTH
+
+    screen = _open_panel(state, target, dc, rst, backlight, speed, bgr, capture)
+    try:
+        screen.clear(BLACK)
+        bars = [("R", (255, 0, 0)), ("G", (0, 255, 0)), ("B", (0, 0, 255)),
+                ("W", (255, 255, 255))]
+        for i, (label, colour) in enumerate(bars):
+            screen.fill((0, i * 20, WIDTH, i * 20 + 19), colour)
+            screen.text(4, i * 20 + 4, label, BLACK, size=11, bold=True)
+        y = 88
+        y = screen.text(4, y, f"spidev{target}", FG, size=9)
+        y = screen.text(4, y, f"DC {dc}  RST {rst}", DIM, size=9)
+        y = screen.text(4, y, f"{speed / 1e6:.0f} MHz", DIM, size=9)
+        y = screen.text(4, y, "BGR" if bgr else "RGB", DIM, size=9)
+        # Corner marks: if any is clipped, the offsets are wrong for this panel.
+        for cx, cy in ((0, 0), (WIDTH - 1, 0), (0, 159), (WIDTH - 1, 159)):
+            screen.fill((cx - 3, cy - 3, cx + 3, cy + 3), ACCENT)
+        screen.flush()
+    finally:
+        screen.close()
+    state.console.print(
+        "[green]drew test pattern[/] [dim]— bars top to bottom should read "
+        "red, green, blue, white; all four corner marks should be visible[/]"
+    )
+
+
+@panel.command("off")
+@_panel_options
+@pass_state
+def panel_off(state: State, target, dc, rst, backlight, speed, bgr, capture):
+    """Blank the panel and let go of it."""
+    screen = _open_panel(state, target, dc, rst, backlight, speed, bgr, capture)
+    screen.close(blank=True)
+    state.console.print("[dim]panel cleared[/]")
 
 
 # ==========================================================================

@@ -29,3 +29,10 @@ updev-art.img
 inventory*.json
 updev-boot-*.png
 *.ppm
+
+# camtoy writes saved frames and light paintings here.
+camtoy-shots/
+
+# camtoy neural network weights: 850MB, fetched with `camtoy models pull`.
+models/
+.venv-nn/

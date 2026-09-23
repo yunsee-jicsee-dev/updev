@@ -9,7 +9,7 @@ description = "One device manager for the whole board: LAN, USB, I2C, SPI, seria
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-keywords = ["raspberry-pi", "device-manager", "i2c", "spi", "usb", "gpio", "hardware"]
+keywords = ["raspberry-pi", "device-manager", "i2c", "spi", "usb", "gpio", "nfc", "hardware"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
@@ -35,9 +35,9 @@ dependencies = [
 # library disables exactly one backend's extra detail and nothing else.
 hardware = [
     "psutil>=5.9",       # net: interface addresses and per-NIC counters
-    "smbus2>=0.4",       # i2c: address scanning and register access
-    "spidev>=3.5",       # spi: mode/clock detail and the loopback test
-    "pyserial>=3.5",     # serial: port enumeration with USB provenance
+    "smbus2>=0.4",       # i2c: address scanning and register access; nfc: PN532 over I2C
+    "spidev>=3.5",       # spi: mode/clock detail and the loopback test; nfc: RC522/PN532
+    "pyserial>=3.5",     # serial: port enumeration with USB provenance; nfc: PN532 over HSU
     "lgpio>=0.2",        # gpio: chip info and which lines are claimed
 ]
 # picamera2 is apt-only in practice (it needs libcamera bindings that pip
@@ -46,20 +46,35 @@ camera = ["picamera2>=0.3"]
 # Pillow converts the QEMU framebuffer dump to PNG. Without it `floppy boot`
 # still works and just leaves a .ppm.
 vm = ["Pillow>=10.0"]
+# The ST7735S front panel. Pillow draws the frame, luma.lcd ships it over SPI.
+panel = ["luma.lcd>=2.13", "Pillow>=10.0"]
+# camtoy. Frames arrive through an ffmpeg pipe, so there is no capture library
+# here — numpy does the image work and Pillow does resampling and PNG output.
+camtoy = ["numpy>=1.24", "Pillow>=10.0"]
+# Only `--display window` needs pygame, and only `camtoy theremin` needs audio.
+# Both stay optional so a headless board can still run the terminal modes.
+camtoy-window = ["pygame>=2.5"]
+camtoy-audio = ["sounddevice>=0.4"]
+# The ten neural modes. Weights are not packaged — they are 850MB and carry
+# their own licences; `camtoy models pull` fetches them.
+camtoy-nn = ["onnxruntime>=1.17"]
 dev = ["pytest>=7.0", "build>=1.0"]
 all = [
     "updev[hardware]",
     "updev[vm]",
+    "updev[panel]",
+    "updev[camtoy]",
 ]
 
 [project.scripts]
 updev = "updev.cli:main"
+camtoy = "camtoy.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/yunsee-jicsee-dev/updev"
 
 [tool.setuptools.packages.find]
-include = ["updev*"]
+include = ["updev*", "camtoy*"]
 exclude = ["tests*"]
 
 [tool.pytest.ini_options]

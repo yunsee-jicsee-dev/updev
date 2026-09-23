@@ -584,21 +584,39 @@ class TestUsbZone(unittest.TestCase):
         return Device(uid=uid, kind=Kind.USB, name="Mass Storage",
                       status=Status.ONLINE, address=address, tags=["storage"])
 
-    def test_recognises_usb_storage(self):
+    def test_reacts_to_any_usb_device_not_just_storage(self):
+        zone = self._zone()
+        self.assertTrue(zone._is_candidate(self._stick()))
+        keyboard = Device(uid="usb:1-2", kind=Kind.USB, name="kbd", tags=["input"])
+        self.assertTrue(zone._is_candidate(keyboard))
+        root_hub = Device(uid="usb:usb1", kind=Kind.USB, name="root hub",
+                          tags=["root-hub"])
+        self.assertFalse(zone._is_candidate(root_hub))
+        i2c_chip = Device(uid="i2c:1:0x3c", kind=Kind.I2C, name="SSD1306")
+        self.assertFalse(zone._is_candidate(i2c_chip))
+
+    def test_storage_only_restores_the_old_behaviour(self):
+        from rich.console import Console
+
         from updev.ui.zone import UsbZone
 
-        self.assertTrue(UsbZone._is_usb_storage(self._stick()))
+        zone = UsbZone(Scanner(), ProbeContext(), Console(quiet=True),
+                       storage_only=True)
+        self.assertTrue(zone._is_candidate(self._stick()))
         keyboard = Device(uid="usb:1-2", kind=Kind.USB, name="kbd", tags=["input"])
-        self.assertFalse(UsbZone._is_usb_storage(keyboard))
+        self.assertFalse(zone._is_candidate(keyboard))
 
     def test_plugging_in_produces_a_card(self):
         zone = self._zone()
         zone._present(self._stick())
         self.assertIsNotNone(zone.current)
         self.assertEqual(len(zone.history), 1)
-        dev, verdict = zone.current
+        dev, recognition = zone.current
         self.assertEqual(dev.address, "2-1")
-        self.assertIsNotNone(verdict.usb_class)
+        self.assertIsNotNone(recognition.storage)
+        # The whole point of the merge: an identification comes with something
+        # to run against it.
+        self.assertTrue(recognition.tools)
 
     def test_unplugging_clears_the_card(self):
         zone = self._zone()
@@ -1215,12 +1233,27 @@ class TestPassthroughSafety(unittest.TestCase):
         )
 
     def test_hub_is_blocked(self):
-        import os
+        """Whichever port has a hub on it, passing it through must be refused.
 
-        if not os.path.isdir("/sys/bus/usb/devices/1-2"):
-            self.skipTest("1-2 is not attached")
-        check = check_passthrough("1-2")
-        self.assertTrue(any("hub" in b for b in check.blockers))
+        Addressed by class rather than by address: which port holds the hub
+        changes every time something is replugged.
+        """
+        import os
+        from pathlib import Path
+
+        root = Path("/sys/bus/usb/devices")
+        hubs = [
+            entry.name
+            for entry in sorted(root.glob("*-*"))
+            if ":" not in entry.name
+            and (entry / "bDeviceClass").exists()
+            and (entry / "bDeviceClass").read_text().strip() == "09"
+        ]
+        if not hubs:
+            self.skipTest("no external hub is attached")
+        check = check_passthrough(hubs[0])
+        self.assertTrue(any("hub" in b for b in check.blockers),
+                        f"{hubs[0]} is a hub but was not refused: {check.blockers}")
 
 
 class TestBootPlan(unittest.TestCase):
@@ -1271,3 +1304,1076 @@ class TestSerialisation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ==========================================================================
+# the merge: recognition -> tools
+# ==========================================================================
+
+class TestToolkit(unittest.TestCase):
+    """Which tool gets offered for which device.
+
+    `tools_for` is pure, so every branch is reachable without owning a floppy
+    drive, an optical drive or an NFC module.
+    """
+
+    @staticmethod
+    def _storage(usb_class):
+        from updev.usbclass import Confidence, Verdict
+
+        return Verdict(usb_class=usb_class, confidence=Confidence.HIGH)
+
+    @staticmethod
+    def _roles(*roles):
+        from updev.usbrole import RoleVerdict
+
+        return RoleVerdict(roles=list(roles))
+
+    def _names(self, tools):
+        return [t.name for t in tools]
+
+    def test_floppy_toy_is_offered_to_the_floppy_and_nobody_else(self):
+        from updev.toolkit import tools_for
+        from updev.usbclass import UsbClass
+
+        floppy = tools_for("3-2", self._roles(), self._storage(UsbClass.FUSB),
+                           {"block": ["/dev/sdb"]})
+        self.assertIn("floppy-make", self._names(floppy))
+        self.assertIn("floppy-write", self._names(floppy))
+
+        for other in (UsbClass.NUSB, UsbClass.HUSB, UsbClass.SUSB):
+            tools = tools_for("4-1", self._roles(), self._storage(other),
+                              {"block": ["/dev/sda"]})
+            self.assertNotIn("floppy-make", self._names(tools),
+                             f"{other} was offered the floppy image builder")
+            self.assertNotIn("floppy-write", self._names(tools),
+                             f"{other} was offered a dd command")
+
+    def test_the_only_destructive_tool_is_the_floppy_write(self):
+        from updev.toolkit import tools_for
+        from updev.usbclass import UsbClass
+
+        for cls in UsbClass:
+            tools = tools_for("3-2", self._roles(), self._storage(cls),
+                              {"block": ["/dev/sdb"]})
+            for tool in tools:
+                if tool.destructive:
+                    self.assertEqual(tool.name, "floppy-write")
+                    self.assertEqual(cls, UsbClass.FUSB)
+
+    def test_lead_tool_is_the_benchmark_for_a_plain_stick(self):
+        from updev.toolkit import tools_for
+        from updev.usbclass import UsbClass
+
+        tools = tools_for("1-1", self._roles(), self._storage(UsbClass.NUSB),
+                          {"block": ["/dev/sdc"]})
+        lead = next(t for t in tools if t.lead)
+        self.assertEqual(lead.name, "bench")
+        self.assertIn("/dev/sdc", lead.command)
+
+    def test_camera_gets_camtoy_and_the_right_video_node(self):
+        from updev.toolkit import tools_for
+        from updev.usbrole import UsbRole
+
+        tools = tools_for("1-2.4", self._roles(UsbRole.CAMERA), None,
+                          {"video4linux": ["/dev/video0", "/dev/video1"]})
+        lead = next(t for t in tools if t.lead)
+        self.assertEqual(lead.name, "camtoy")
+        self.assertIn("/dev/video0", lead.command)
+
+    def test_keyboard_gets_the_evdev_tap_addressed_by_usb_address(self):
+        from updev.toolkit import tools_for
+        from updev.usbrole import UsbRole
+
+        tools = tools_for("1-2.2", self._roles(UsbRole.KEYBOARD, UsbRole.MOUSE),
+                          None, {"input": ["/dev/input/input29"]})
+        lead = next(t for t in tools if t.lead)
+        self.assertEqual(lead.command, "updev hid watch 1-2.2")
+
+    def test_serial_and_network_use_their_own_nodes(self):
+        from updev.toolkit import tools_for
+        from updev.usbrole import UsbRole
+
+        serial = tools_for("1-3", self._roles(UsbRole.SERIAL), None,
+                           {"tty": ["/dev/ttyUSB0"]})
+        self.assertIn("updev serial monitor ttyUSB0 -b 115200",
+                      [t.command for t in serial])
+
+        wifi = tools_for("1-4", self._roles(UsbRole.WIFI), None, {"net": ["wlan1"]})
+        self.assertIn("updev net scan --iface wlan1", [t.command for t in wifi])
+
+    def test_every_usb_device_can_at_least_be_traced(self):
+        from updev.toolkit import tools_for
+        from updev.usbrole import UsbRole
+
+        for role in UsbRole:
+            tools = tools_for("2-1", self._roles(role), None, {})
+            commands = [t.command for t in tools]
+            self.assertIn("updev usb path 2-1", commands, f"{role} lost the path tool")
+
+    def test_a_command_is_never_offered_twice(self):
+        from updev.toolkit import tools_for
+        from updev.usbrole import UsbRole
+
+        tools = tools_for("1-2.2", self._roles(UsbRole.KEYBOARD), None, {})
+        commands = [t.command for t in tools]
+        self.assertEqual(len(commands), len(set(commands)))
+
+    def test_composite_device_gets_both_sets(self):
+        from updev.toolkit import tools_for
+        from updev.usbrole import UsbRole
+
+        tools = tools_for("1-5", self._roles(UsbRole.CAMERA, UsbRole.AUDIO), None,
+                          {"video4linux": ["/dev/video2"], "sound": ["card1"]})
+        names = self._names(tools)
+        self.assertIn("camtoy", names)
+        self.assertIn("audio-play", names)
+
+    def test_non_usb_devices_reuse_the_actions_their_backend_attached(self):
+        from updev.toolkit import tools_for_device
+
+        dev = Device(uid="i2c:1", kind=Kind.I2C, name="i2c-1")
+        dev.act("scan", "Probe every address", "updev i2c scan 1")
+        tools = tools_for_device(dev)
+        self.assertEqual(tools[0].command, "updev i2c scan 1")
+        self.assertTrue(tools[0].lead)
+        # A reader on jumper wires has nothing to enumerate it, so the bus it
+        # would hang off carries the hint instead.
+        self.assertIn("updev nfc detect", [t.command for t in tools])
+
+    def test_missing_binaries_are_flagged_not_hidden(self):
+        from updev.toolkit import Tool, annotate
+
+        tools = [Tool("x", "t", "cmd", "why", needs="definitely-not-a-real-binary"),
+                 Tool("y", "t", "cmd2", "why")]
+        annotate(tools)
+        self.assertTrue(tools[0].missing)
+        self.assertFalse(tools[1].missing)
+
+    def test_recognition_serialises(self):
+        from updev.toolkit import Recognition, tools_for
+        from updev.usbclass import UsbClass
+        from updev.usbrole import UsbRole
+
+        dev = Device(uid="usb:3-2", kind=Kind.USB, name="TEAC FD-05PUB", address="3-2")
+        recognition = Recognition(
+            device=dev,
+            roles=self._roles(UsbRole.STORAGE),
+            storage=self._storage(UsbClass.FUSB),
+            nodes={"block": ["/dev/sdb"]},
+            tools=tools_for("3-2", self._roles(UsbRole.STORAGE),
+                            self._storage(UsbClass.FUSB), {"block": ["/dev/sdb"]}),
+        )
+        payload = recognition.as_dict()
+        self.assertEqual(payload["badge"], "FUSB")
+        self.assertTrue(payload["tools"])
+        self.assertIn("command", payload["tools"][0])
+        import json
+
+        json.dumps(payload)          # must survive the --json path
+
+
+# ==========================================================================
+# NFC
+# ==========================================================================
+
+class TestNfcProtocol(unittest.TestCase):
+    """Frames and checksums, which is where a wired reader actually fails."""
+
+    def test_crc_a_matches_the_iso_14443_reference_vectors(self):
+        from updev.nfc import crc_a
+
+        # ISO/IEC 14443-3 Annex B: CRC_A over 00 00 is 0x1EA0, sent LSB first.
+        self.assertEqual(crc_a(b"\x00\x00"), bytes((0xA0, 0x1E)))
+        self.assertEqual(crc_a(b"\x12\x34"), bytes((0x26, 0xCF)))
+
+    def test_pn532_firmware_frame_is_byte_for_byte_the_documented_one(self):
+        from updev.nfc import pn532_frame
+
+        self.assertEqual(pn532_frame(0x02).hex(), "0000ff02fed4022a00")
+
+    def test_pn532_response_parses_to_ic_and_version(self):
+        from updev.nfc import parse_pn532_frame
+
+        code, payload = parse_pn532_frame(bytes.fromhex("0000ff06fad50332010607e800"))
+        self.assertEqual(code, 0x03)
+        self.assertEqual(payload, bytes((0x32, 0x01, 0x06, 0x07)))
+
+    def test_a_corrupt_frame_is_refused_rather_than_half_read(self):
+        from updev.nfc import parse_pn532_frame
+
+        good = bytearray.fromhex("0000ff06fad50332010607e800")
+        bad_len = bytes(good[:3] + bytearray([0x06, 0x00]) + good[5:])
+        with self.assertRaises(ValueError):
+            parse_pn532_frame(bad_len)
+
+        bad_dcs = bytearray(good)
+        bad_dcs[-2] ^= 0xFF
+        with self.assertRaises(ValueError):
+            parse_pn532_frame(bytes(bad_dcs))
+
+    def test_ack_is_reported_as_an_ack(self):
+        from updev.nfc import PN532_ACK, parse_pn532_frame
+
+        with self.assertRaises(ValueError) as caught:
+            parse_pn532_frame(PN532_ACK)
+        self.assertIn("ACK", str(caught.exception))
+
+    def test_spi_bit_order_is_reversed(self):
+        from updev.nfc import bit_reverse, reverse_bytes
+
+        self.assertEqual(bit_reverse(0x01), 0x80)      # data write
+        self.assertEqual(bit_reverse(0x02), 0x40)      # status read
+        self.assertEqual(bit_reverse(0x03), 0xC0)      # data read
+        self.assertEqual(reverse_bytes(b"\x01\x02"), b"\x80\x40")
+
+    def test_bcc_catches_a_corrupt_uid(self):
+        from updev.nfc import uid_from_anticollision
+
+        uid = bytes((0xDE, 0xAD, 0xBE, 0xEF))
+        good = uid + bytes((0xDE ^ 0xAD ^ 0xBE ^ 0xEF,))
+        self.assertEqual(uid_from_anticollision(good), uid)
+        with self.assertRaises(ValueError):
+            uid_from_anticollision(uid + b"\x00")
+
+    def test_sak_and_atqa_are_decoded(self):
+        from updev.nfc import atqa_describe, sak_describe
+
+        self.assertEqual(sak_describe(0x08), "MIFARE Classic 1K")
+        self.assertEqual(sak_describe(0x18), "MIFARE Classic 4K")
+        self.assertIn("ISO 14443-4", sak_describe(0x20))
+        self.assertIn("4-byte UID", atqa_describe(b"\x04\x00"))
+
+    def test_mifare_sector_geometry(self):
+        from updev.nfc import describe_block, sector_blocks
+
+        self.assertEqual(sector_blocks(0), [0, 1, 2, 3])
+        self.assertEqual(sector_blocks(1), [4, 5, 6, 7])
+        self.assertEqual(sector_blocks(32)[0], 128)
+        self.assertEqual(len(sector_blocks(32)), 16)
+        self.assertIn("manufacturer", describe_block(0, b""))
+        self.assertIn("trailer", describe_block(7, b""))
+
+    def test_rc522_address_byte_encodes_direction(self):
+        from updev.nfc import Mfrc522
+
+        self.assertEqual(Mfrc522.address(0x37, read=True), 0xEE)
+        self.assertEqual(Mfrc522.address(0x37, read=False), 0x6E)
+
+
+class _FakeSpi:
+    """Enough spidev to drive the RC522 register interface in a test."""
+
+    def __init__(self, registers=None):
+        self.registers = dict(registers or {})
+        self.writes = []
+
+    def xfer2(self, payload):
+        address = payload[0]
+        register = (address & 0x7E) >> 1
+        if address & 0x80:
+            return [0x00, self.registers.get(register, 0x00)]
+        self.registers[register] = payload[1]
+        self.writes.append((register, payload[1]))
+        return [0x00, 0x00]
+
+
+class TestRc522Driver(unittest.TestCase):
+    def test_version_register_identifies_the_silicon(self):
+        from updev.nfc import Mfrc522
+
+        chip = Mfrc522(_FakeSpi({0x37: 0x92}))
+        raw, name = chip.version()
+        self.assertEqual(raw, 0x92)
+        self.assertEqual(name, "MFRC522 v2.0")
+
+    def test_an_idle_bus_reads_back_as_nothing(self):
+        from updev.nfc import Mfrc522
+
+        raw, name = Mfrc522(_FakeSpi()).version()
+        self.assertEqual(raw, 0x00)
+        self.assertIn("unknown", name)
+
+    def test_antenna_only_writes_when_it_is_off(self):
+        from updev.nfc import Mfrc522
+
+        spi = _FakeSpi({0x14: 0x03})
+        Mfrc522(spi).antenna(True)
+        self.assertEqual(spi.writes, [])            # already on, leave it alone
+
+        spi = _FakeSpi({0x14: 0x00})
+        Mfrc522(spi).antenna(True)
+        self.assertEqual(spi.writes, [(0x14, 0x03)])
+
+
+class _FakeTransport:
+    """A PN532 that answers GetFirmwareVersion, ACK first, as the chip does."""
+
+    def __init__(self):
+        self.sent = []
+        self.replies = [
+            bytes.fromhex("0000ff00ff00"),                    # ACK
+            bytes.fromhex("0000ff06fad50332010607e800"),      # firmware 1.6
+        ]
+
+    def send(self, frame):
+        self.sent.append(frame)
+
+    def receive(self, count):
+        return self.replies.pop(0) if self.replies else b""
+
+
+class TestPn532Driver(unittest.TestCase):
+    def test_firmware_version_survives_the_leading_ack(self):
+        from updev.nfc import Pn532
+
+        transport = _FakeTransport()
+        ic, detail = Pn532(transport).firmware_version()
+        self.assertEqual(ic, 0x32)
+        self.assertIn("PN532", detail)
+        self.assertIn("1.6", detail)
+        self.assertEqual(transport.sent[0].hex(), "0000ff02fed4022a00")
+
+    def test_a_mismatched_answer_is_rejected(self):
+        from updev.nfc import NfcError, Pn532
+
+        class _Wrong(_FakeTransport):
+            def __init__(self):
+                super().__init__()
+                # A valid frame, but the answer to a different command.
+                self.replies = [bytes.fromhex("0000ff03fdd54b00dd00")]
+
+        with self.assertRaises(NfcError):
+            Pn532(_Wrong()).firmware_version()
+
+
+class TestNfcWiring(unittest.TestCase):
+    def test_every_wiring_names_power_ground_and_a_bus(self):
+        from updev.nfc import WIRINGS
+
+        self.assertTrue(WIRINGS)
+        for wiring in WIRINGS:
+            pins = {name.upper() for name, _, _ in wiring.wires}
+            self.assertTrue(any(p.startswith(("3.3V", "VCC")) for p in pins),
+                            f"{wiring.module} has no power wire")
+            self.assertIn("GND", pins, f"{wiring.module} has no ground")
+            self.assertIn(wiring.bus, ("spi", "i2c", "uart"))
+            for _, pin, _ in wiring.wires:
+                self.assertTrue(1 <= pin <= 40, f"{wiring.module}: pin {pin}")
+
+    def test_wires_land_on_pins_that_do_what_the_table_claims(self):
+        """Cross-checked against the GPIO backend's own header map, so a typo
+        in one of the two shows up here instead of on a bench."""
+        from updev.backends.gpio import PIN_FUNCTIONS
+        from updev.nfc import WIRINGS
+
+        for wiring in WIRINGS:
+            for name, pin, described in wiring.wires:
+                label, function = PIN_FUNCTIONS[pin]
+                self.assertIn(label, described,
+                              f"{wiring.module} {name} → pin {pin} is {label}, "
+                              f"not {described}")
+
+    def test_wiring_lookup_accepts_a_module_or_a_bus(self):
+        from updev.nfc import wiring_for
+
+        self.assertIsNotNone(wiring_for("rc522"))
+        self.assertIsNotNone(wiring_for("i2c"))
+        self.assertIsNone(wiring_for("smoke signals"))
+
+
+# ==========================================================================
+# HID
+# ==========================================================================
+
+class TestHidDecoding(unittest.TestCase):
+    def test_a_key_press_decodes_to_a_name_and_an_action(self):
+        import struct
+
+        from updev.hid import describe, parse_event
+
+        blob = struct.pack("llHHi", 1700000000, 500000, 0x01, 30, 1)
+        event = parse_event(blob)
+        self.assertEqual(event.code_name, "KEY_A")
+        self.assertEqual(describe(event), "KEY_A press")
+
+        blob = struct.pack("llHHi", 1700000000, 0, 0x01, 30, 0)
+        self.assertEqual(describe(parse_event(blob)), "KEY_A release")
+
+    def test_mouse_movement_keeps_its_sign(self):
+        import struct
+
+        from updev.hid import describe, parse_event
+
+        blob = struct.pack("llHHi", 0, 0, 0x02, 0x00, -3)
+        self.assertEqual(describe(parse_event(blob)), "REL_X -3")
+
+    def test_buttons_and_gamepads_are_named(self):
+        from updev.hid import KEY_NAMES
+
+        self.assertEqual(KEY_NAMES[0x110], "BTN_LEFT")
+        self.assertEqual(KEY_NAMES[57], "KEY_SPACE")
+        self.assertEqual(KEY_NAMES[103], "KEY_UP")
+        self.assertIn("BTN_SOUTH", KEY_NAMES[0x130])
+
+    def test_framing_events_are_marked_as_noise(self):
+        import struct
+
+        from updev.hid import parse_event
+
+        syn = parse_event(struct.pack("llHHi", 0, 0, 0x00, 0, 0))
+        self.assertTrue(syn.is_noise)
+        scan = parse_event(struct.pack("llHHi", 0, 0, 0x04, 0x04, 0x70004))
+        self.assertTrue(scan.is_noise)
+        key = parse_event(struct.pack("llHHi", 0, 0, 0x01, 30, 1))
+        self.assertFalse(key.is_noise)
+
+    def test_a_short_read_is_an_error_not_a_guess(self):
+        from updev.hid import parse_event
+
+        with self.assertRaises(ValueError):
+            parse_event(b"\x00" * 8)
+
+    def test_unknown_codes_still_render(self):
+        import struct
+
+        from updev.hid import describe, parse_event
+
+        event = parse_event(struct.pack("llHHi", 0, 0, 0x01, 0x2ff, 1))
+        self.assertIn("0x2ff", describe(event))
+
+
+# ==========================================================================
+# disk bench
+# ==========================================================================
+
+class TestBench(unittest.TestCase):
+    def test_seek_latency_separates_platters_from_flash(self):
+        from updev.bench import rotation_hint
+
+        self.assertEqual(rotation_hint(12.4)[0], "rotating")
+        self.assertEqual(rotation_hint(4.0)[0], "rotating")
+        self.assertEqual(rotation_hint(0.18)[0], "solid-state")
+        self.assertEqual(rotation_hint(2.0)[0], "unclear")
+        self.assertEqual(rotation_hint(0.0)[0], "unknown")
+
+    def test_a_cached_read_is_not_evidence_about_the_medium(self):
+        from updev.bench import rotation_hint
+
+        verdict, reason = rotation_hint(0.001)
+        self.assertEqual(verdict, "cached")
+        self.assertIn("cache", reason)
+
+    def test_link_comparison_blames_the_right_half(self):
+        from updev.bench import link_comparison
+
+        self.assertIn("medium is the limit", link_comparison(42, 5000))
+        self.assertIn("bus is the limit", link_comparison(480, 5000))
+        self.assertEqual(link_comparison(42, 0), "")
+
+    def test_a_real_read_produces_a_serialisable_result(self):
+        import json
+        import os
+        import tempfile
+
+        from updev.bench import run
+
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(os.urandom(4 * 1024 * 1024))
+            path = handle.name
+        try:
+            result = run(path, chunk_mb=1, reads=3, seeks=8)
+            self.assertGreater(result.reads, 0)
+            self.assertGreater(result.throughput_mbs, 0)
+            json.dumps(result.as_dict())
+        finally:
+            os.unlink(path)
+
+
+# ==========================================================================
+# the GUI
+# ==========================================================================
+
+def _has_tkinter() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("tkinter") is not None
+
+
+@unittest.skipUnless(_has_tkinter(), "python3-tk is not installed")
+class TestEditorDispatch(unittest.TestCase):
+    """Which panel opens for which device. No window is created — the mapping
+    is plain data, and it is the part that would silently go wrong."""
+
+    def _names(self, device):
+        from updev.gui.app import editors_for
+
+        return [cls.__name__ for cls in editors_for(device)]
+
+    def test_every_device_opens_something(self):
+        """The info panel is the floor: no device may open to a blank frame."""
+        for kind in Kind:
+            device = Device(uid=f"{kind}:x", kind=kind, name="thing")
+            self.assertEqual(self._names(device)[-1], "InfoEditor",
+                             f"{kind} has no fallback panel")
+
+    def test_nfc_reader_gets_the_tag_editor(self):
+        device = Device(uid="nfc:mfrc522:spidev0.0", kind=Kind.NFC, name="MFRC522",
+                        address="/dev/spidev0.0")
+        self.assertEqual(self._names(device)[0], "TagEditor")
+
+    def test_i2c_chip_gets_registers_but_a_bare_bus_does_not(self):
+        chip = Device(uid="i2c:1:0x3c", kind=Kind.I2C, name="SSD1306", address="0x3c")
+        self.assertIn("RegisterEditor", self._names(chip))
+        bus = Device(uid="i2c:1", kind=Kind.I2C, name="i2c-1")
+        self.assertNotIn("RegisterEditor", self._names(bus))
+
+    def test_gpio_gets_the_pin_editor(self):
+        device = Device(uid="gpio:chip0", kind=Kind.GPIO, name="gpiochip0")
+        self.assertIn("PinEditor", self._names(device))
+
+    def test_block_device_gets_the_sector_viewer(self):
+        device = Device(uid="blk:sda", kind=Kind.STORAGE, name="sda", node="/dev/sda")
+        self.assertIn("BlockEditor", self._names(device))
+
+    def test_write_capable_panels_are_declared(self):
+        """The badge that marks a panel dangerous comes from this flag, so a
+        panel that can write and doesn't say so is a real bug."""
+        from updev.gui.floppy import FloppyEditor
+        from updev.gui.panels import BlockEditor, InfoEditor, RegisterEditor
+        from updev.gui.tag import TagEditor
+
+        for panel in (FloppyEditor, TagEditor, RegisterEditor):
+            self.assertTrue(panel.WRITES, f"{panel.__name__} writes but says it doesn't")
+        for panel in (BlockEditor, InfoEditor):
+            self.assertFalse(panel.WRITES)
+
+    def test_block_node_does_not_hand_back_a_sysfs_directory(self):
+        """A USB device's `node` is its sysfs directory; opening that as a
+        block device fails with EISDIR, which is a bad way to find out."""
+        from updev.gui.base import block_node
+
+        disk = Device(uid="blk:sda", kind=Kind.STORAGE, name="sda", node="/dev/sda")
+        self.assertEqual(block_node(disk), "/dev/sda")
+
+        usb = Device(uid="usb:4-1", kind=Kind.USB, name="disk",
+                     node="/sys/bus/usb/devices/4-1", address="")
+        self.assertEqual(block_node(usb), "")      # no address, nothing to resolve
+
+        keyboard = Device(uid="usb:1-1", kind=Kind.USB, name="kbd",
+                          node="/sys/bus/usb/devices/1-1", address="1-1")
+        self.assertFalse(block_node(keyboard).startswith("/sys"))
+
+    def test_hex_view_column_maths(self):
+        """Double-clicking a hex pair has to land on the byte under the cursor."""
+        from updev.gui.base import HexView
+
+        self.assertEqual(HexView._offset_for(1, 10), 0)     # first byte
+        self.assertEqual(HexView._offset_for(1, 12), 0)     # second nibble
+        self.assertEqual(HexView._offset_for(1, 13), 1)
+        self.assertEqual(HexView._offset_for(2, 10), 16)    # next row
+        self.assertIsNone(HexView._offset_for(1, 4))        # in the offset column
+        self.assertIsNone(HexView._offset_for(1, 90))       # out in the ASCII
+
+
+class TestFloppyRoundTrip(unittest.TestCase):
+    """What the GUI's floppy editor does, minus the widgets: load, edit, rebuild.
+
+    The editor never patches an image in place — it reassembles through
+    `build_image()` — so this is the operation that has to survive.
+    """
+
+    def test_edited_file_survives_a_rebuild(self):
+        from updev.floppy import build_image, gallery, inspect_image, read_file
+
+        files = dict(gallery())
+        files["README.TXT"] = "edited by the gui\nsecond line\n"
+        files["NEW.TXT"] = "a file that was not there before\n"
+        image = build_image(label="EDITED", files=files)
+
+        info = inspect_image(image.data)
+        self.assertEqual(info["volume_label"], "EDITED")
+        names = {e["name"] for e in info["entries"] if not e["volume_label"]}
+        self.assertIn("NEW.TXT", names)
+
+        back = read_file(image.data, "README.TXT").decode()
+        self.assertIn("edited by the gui", back)
+        self.assertIn("second line", back)
+        self.assertEqual(read_file(image.data, "NEW.TXT").decode().strip(),
+                         "a file that was not there before")
+
+    def test_the_boot_message_budget_is_reported_not_discovered_late(self):
+        from updev.floppy import build_boot_code
+        from updev.gui.floppy import BOOT_BUDGET
+
+        used = len(build_boot_code("short\r\n"))
+        self.assertLess(used, BOOT_BUDGET)
+        with self.assertRaises(ValueError) as caught:
+            build_boot_code("x" * (BOOT_BUDGET + 1))
+        self.assertIn("overflows", str(caught.exception))
+
+    def test_a_rebuilt_image_is_still_a_bootable_floppy(self):
+        from updev.floppy import FLOPPY_SIZE, build_image, inspect_image
+
+        image = build_image(label="EDITED", files={"A.TXT": "hello\n"})
+        self.assertEqual(image.size, FLOPPY_SIZE)
+        info = inspect_image(image.data)
+        self.assertTrue(info["bootable_signature_present"])
+        self.assertEqual(info["fs_type"], "FAT12")
+
+
+class TestMifareWriteGuards(unittest.TestCase):
+    """The two writes that damage a card rather than change it."""
+
+    def test_trailer_geometry(self):
+        from updev.nfc import is_trailer
+
+        self.assertEqual([b for b in range(16) if is_trailer(b)], [3, 7, 11, 15])
+        self.assertTrue(is_trailer(143))         # sector 32 is 16 blocks long
+        self.assertFalse(is_trailer(131))
+
+    def test_block_zero_is_refused_outright(self):
+        from updev.nfc import NfcError, check_writable
+
+        with self.assertRaises(NfcError) as caught:
+            check_writable(0)
+        self.assertIn("manufacturer", str(caught.exception))
+        # Not even the override opens it — a genuine card would refuse anyway.
+        with self.assertRaises(NfcError):
+            check_writable(0, allow_trailer=True)
+
+    def test_trailers_need_an_explicit_override(self):
+        from updev.nfc import NfcError, check_writable
+
+        with self.assertRaises(NfcError):
+            check_writable(7)
+        self.assertIsNone(check_writable(7, allow_trailer=True))
+        self.assertIsNone(check_writable(5))
+
+    def test_a_short_block_is_refused_before_it_reaches_the_card(self):
+        from updev.nfc import Mfrc522
+
+        chip = Mfrc522(_FakeSpi({0x37: 0x92}))
+        with self.assertRaises(ValueError):
+            chip.write_block(4, b"\x00" * 15)
+
+    def test_a_nak_is_not_reported_as_success(self):
+        from updev.nfc import Mfrc522, NfcError
+
+        chip = Mfrc522(_FakeSpi({0x37: 0x92}))
+        with self.assertRaises(NfcError):
+            chip._expect_ack(b"\x00", 4, "write")      # 0x00 is a NAK
+        with self.assertRaises(NfcError):
+            chip._expect_ack(b"\x0a", 8, "write")      # right value, wrong width
+        self.assertIsNone(chip._expect_ack(b"\x0a", 4, "write"))
+
+
+class PanelTests(unittest.TestCase):
+    """The ST7735S front panel, drawn into memory instead of onto glass.
+
+    A headless Screen runs the same layout code as a live one, so everything
+    here would catch a regression that shows up as an unreadable panel.
+    """
+
+    def _screen(self):
+        from updev.panel.screen import Screen
+        return Screen(None)
+
+    def test_a_missing_panel_is_a_screen_you_can_still_draw_on(self):
+        from updev.panel import open_panel
+
+        screen = open_panel(port=99, cs=9, required=False)
+        self.assertFalse(screen.live)
+        screen.text(0, 0, "still fine")
+        screen.flush()
+        self.assertEqual(screen.frames, 1)
+        screen.close()                     # a no-op, not an AttributeError
+
+    def test_a_missing_panel_says_which_node_it_wanted(self):
+        from updev.panel import PanelUnavailable, open_panel
+
+        with self.assertRaises(PanelUnavailable) as caught:
+            open_panel(port=99, cs=9)
+        self.assertIn("/dev/spidev99.9", str(caught.exception))
+
+    def test_the_no_hardware_switch_degrades_instead_of_failing(self):
+        from unittest import mock
+        from updev.panel import open_panel
+        import updev.panel.screen as screen_mod
+
+        # required=True and a panel that really is attached — the switch still
+        # wins, because "I have no display today" is the thing it means.
+        with mock.patch.object(screen_mod, "USE_PHYSICAL_DISPLAY", False):
+            screen = open_panel(required=True)
+        self.assertFalse(screen.live)
+
+    def test_the_wiring_matches_the_drawpad(self):
+        from updev.panel import screen as s
+
+        # Same panel, same wires, two programs. A change here without a change
+        # in st7735s_drawpad.py means one of them is driving the wrong pins.
+        self.assertEqual((s.GRID_W, s.GRID_H), (128, 160))
+        self.assertEqual((s.SPI_PORT, s.SPI_DEVICE), (0, 0))
+        self.assertEqual((s.PIN_DC, s.PIN_RST), (24, 25))
+
+    def test_the_persisting_close_never_releases_the_reset_line(self):
+        from updev.panel.screen import Screen
+
+        class FakeDevice:
+            persist = False
+            cleaned = False
+
+            def cleanup(self):
+                self.cleaned = True
+
+        # Releasing DC/RST hands them back as inputs; with no pull-up on RES
+        # the panel resets itself seconds after we exit. So the default close
+        # must not call cleanup at all, and must defuse luma's atexit hook.
+        device = FakeDevice()
+        Screen(device).close()
+        self.assertFalse(device.cleaned)
+        self.assertTrue(device.persist)
+        device.cleanup()                      # the atexit hook's call
+        self.assertFalse(device.cleaned)
+
+    def test_blanking_does_release_the_panel(self):
+        from updev.panel.screen import Screen
+
+        class FakeDevice:
+            persist = True
+            cleaned = False
+
+            def cleanup(self):
+                self.cleaned = True
+
+        device = FakeDevice()
+        Screen(device).close(blank=True)
+        self.assertTrue(device.cleaned)
+        self.assertFalse(device.persist)
+
+    def test_text_is_clipped_to_the_column_it_was_given(self):
+        screen = self._screen()
+        long = "br-886746f5b20a-and-then-some"
+        clipped = screen.truncate(long, 60)
+        self.assertTrue(clipped.endswith("…"))
+        self.assertLess(len(clipped), len(long))
+        self.assertEqual(screen.truncate("spi", 60), "spi")
+
+    def test_every_backend_gets_a_row_that_fits_on_the_panel(self):
+        from updev.core.model import BackendReport
+        from updev.panel.boot import progress
+
+        screen = self._screen()
+        planned = [f"backend{i}" for i in range(14)]
+        done = {"backend0": BackendReport("backend0", True, ok=True, count=3)}
+        progress(screen, planned, done)
+        # Nothing drawn outside the canvas, and the frame did go out.
+        self.assertEqual(screen.image.size, (128, 160))
+        self.assertEqual(screen.frames, 1)
+
+    def test_the_status_chips_account_for_every_device(self):
+        from updev.panel.boot import _CHIP_ORDER
+
+        # Whatever a backend reports, there is a chip for it — a status missing
+        # from this tuple would silently vanish from the summary's arithmetic.
+        self.assertEqual(set(_CHIP_ORDER), set(Status))
+
+    def test_the_summary_skips_facts_the_scan_did_not_produce(self):
+        from updev.panel.boot import _facts
+
+        result = ScanResult(devices=[
+            Device(uid="host:board", kind=Kind.HOST, name="Raspberry Pi 5 Model B Rev 1.1",
+                   status=Status.ONLINE, metrics={"uptime_s": 3600.0}),
+            Device(uid="host:soc", kind=Kind.SOC, name="BCM2712", status=Status.ONLINE,
+                   metrics={"temp_c": 63.9, "freq_hz": 2.4e9}),
+        ])
+        facts = dict(_facts(result))
+        self.assertEqual(facts["board"], "Pi 5 Model B")   # revision is noise at 128px
+        self.assertIn("64°C", facts["soc"])
+        self.assertEqual(facts["up"], "1h 0m")
+        self.assertNotIn("mem", facts)                     # no memory device, no row
+
+    def test_the_primary_interface_is_the_one_with_the_default_route(self):
+        from updev.panel.boot import _primary_iface
+
+        result = ScanResult(devices=[
+            Device(uid="net:docker0", kind=Kind.NET_IFACE, name="docker0",
+                   status=Status.ONLINE, detail={"ipv4": ["172.17.0.1/16"]}),
+            Device(uid="net:wlan0", kind=Kind.NET_IFACE, name="wlan0",
+                   status=Status.ONLINE,
+                   detail={"ipv4": ["192.168.0.11/24"], "default_route": "yes"}),
+        ])
+        self.assertEqual(_primary_iface(result).name, "wlan0")
+
+    def test_a_scan_reports_progress_as_each_backend_lands(self):
+        seen: list[str] = []
+
+        class Quick(Backend):
+            name = "quick"
+            kinds = (Kind.GPIO,)
+
+            def probe(self, ctx):
+                return [Device(uid="quick:1", kind=Kind.GPIO, name="pin")]
+
+        class Broken(Backend):
+            name = "broken"
+            kinds = (Kind.GPIO,)
+
+            def available(self, ctx):
+                return False, "not wired up"
+
+            def probe(self, ctx):
+                raise AssertionError("must not run")
+
+        scanner = Scanner([Quick(), Broken()])
+        result = scanner.scan(ProbeContext(), on_report=lambda r: seen.append(r.name))
+        # Unavailable backends report too — the panel row has to go somewhere.
+        self.assertEqual(sorted(seen), ["broken", "quick"])
+        self.assertEqual(len(seen), len(result.reports))
+
+
+class PanelServiceTests(unittest.TestCase):
+    """The systemd unit ships as a template on purpose.
+
+    The first version hardcoded /usr/local/bin/updev, which is not where updev
+    lives on a checkout or after a `pip install --user` — the service failed at
+    boot with nothing to show for it. These guard that mistake.
+    """
+
+    def _template(self) -> str:
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        return (root / "systemd" / "updev-panel.service.in").read_text()
+
+    def test_the_unit_resolves_its_paths_at_install_time(self):
+        template = self._template()
+        for placeholder in ("@EXEC@", "@USER@", "@WORKDIR@"):
+            self.assertIn(placeholder, template)
+        self.assertNotIn("/usr/local/bin", template)
+
+    def test_the_unit_does_not_run_as_root(self):
+        # A --user wheel is not on root's import path, and spi+gpio group
+        # membership is all the panel actually needs.
+        template = self._template()
+        self.assertIn("User=@USER@", template)
+        self.assertNotIn("User=root", template)
+
+    def test_the_installer_knows_how_to_fill_the_template_in(self):
+        from pathlib import Path
+        script = (Path(__file__).resolve().parent.parent / "install.sh").read_text()
+        self.assertIn("--panel-service", script)
+        for placeholder in ("@EXEC@", "@USER@", "@WORKDIR@"):
+            self.assertIn(placeholder, script)
+
+
+# ==========================================================================
+# the card model
+# ==========================================================================
+
+class TestMifareAccessBits(unittest.TestCase):
+    """The nine bits that decide who may touch which block.
+
+    Worth testing hard: they are stored twice (once inverted), the meaning of
+    a triple differs between data blocks and the trailer, and one particular
+    combination is a one-way door.
+    """
+
+    #: What every MIFARE Classic ships with: data blocks wide open with either
+    #: key, trailer writable with key A.
+    FACTORY_TRAILER = bytes.fromhex("FFFFFFFFFFFF") + bytes.fromhex("FF078069") + bytes(4)
+
+    def test_factory_trailer_decodes_to_the_transport_configuration(self):
+        from updev.mifare import block_permissions, decode_access_bits, trailer_permissions
+
+        bits = decode_access_bits(self.FACTORY_TRAILER)
+        self.assertTrue(bits.valid)
+        self.assertEqual([bits.triple(g) for g in range(4)],
+                         [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 1)])
+        data = block_permissions(bits, 0)
+        self.assertEqual(data["read"], "A|B")
+        self.assertEqual(data["write"], "A|B")
+        trailer = trailer_permissions(bits)
+        self.assertEqual(trailer["key_a_read"], "—")      # never, on any card
+        self.assertEqual(trailer["key_a_write"], "A")
+        self.assertEqual(trailer["access_write"], "A")
+
+    def test_the_inverted_copy_is_actually_checked(self):
+        from updev.mifare import decode_access_bits
+
+        broken = bytearray(self.FACTORY_TRAILER)
+        broken[6] ^= 0xFF                     # the inverted copy no longer matches
+        self.assertFalse(decode_access_bits(bytes(broken)).valid)
+        self.assertFalse(decode_access_bits(b"\x00" * 4).valid)   # too short
+
+    def test_key_a_is_never_readable_under_any_combination(self):
+        from updev.mifare import AccessBits, trailer_permissions
+
+        for c1 in (0, 1):
+            for c2 in (0, 1):
+                for c3 in (0, 1):
+                    bits = AccessBits(c1=[0, 0, 0, c1], c2=[0, 0, 0, c2],
+                                      c3=[0, 0, 0, c3])
+                    self.assertEqual(trailer_permissions(bits)["key_a_read"], "—")
+
+    def test_the_one_way_door_is_reported_as_such(self):
+        from updev.mifare import AccessBits, block_permissions, trailer_permissions
+
+        locked = AccessBits(c1=[1] * 4, c2=[1] * 4, c3=[1] * 4)
+        self.assertEqual(block_permissions(locked, 0)["read"], "—")
+        self.assertEqual(block_permissions(locked, 0)["write"], "—")
+        trailer = trailer_permissions(locked)
+        self.assertEqual(trailer["access_write"], "—")     # can never be changed back
+        self.assertEqual(trailer["key_b_write"], "—")
+
+    def test_value_block_configuration_allows_decrement_but_not_write(self):
+        from updev.mifare import AccessBits, block_permissions
+
+        value = AccessBits(c1=[0] * 4, c2=[0] * 4, c3=[1] * 4)
+        perms = block_permissions(value, 0)
+        self.assertEqual(perms["write"], "—")
+        self.assertEqual(perms["decrement"], "A|B")
+
+
+class TestMifareGeometry(unittest.TestCase):
+    def test_sak_picks_the_layout(self):
+        from updev.mifare import layout_for_sak
+
+        self.assertEqual(layout_for_sak(0x08).sectors, 16)
+        self.assertEqual(layout_for_sak(0x18).sectors, 40)
+        self.assertFalse(layout_for_sak(0x00).classic)     # Ultralight
+        # A DESFire speaks APDUs, not blocks — no layout is the right answer.
+        self.assertIsNone(layout_for_sak(0x20))
+
+    def test_four_k_sectors_change_size_halfway_through(self):
+        from updev.mifare import layout_for_sak
+
+        card = layout_for_sak(0x18)
+        self.assertEqual(card.blocks_in(0), [0, 1, 2, 3])
+        self.assertEqual(len(card.blocks_in(32)), 16)
+        self.assertEqual(card.blocks_in(32)[0], 128)
+        self.assertEqual(card.trailer_of(32), 143)
+        self.assertTrue(card.is_trailer(143))
+        self.assertFalse(card.is_trailer(131))
+        self.assertEqual(card.sector_of(143), 32)
+
+    def test_access_groups_are_not_one_per_block_on_a_big_sector(self):
+        """In a 16-block sector the first three groups cover five blocks each —
+        the detail that breaks decoders written only against 1K cards."""
+        from updev.mifare import group_of, layout_for_sak
+
+        card = layout_for_sak(0x18)
+        self.assertEqual([group_of(card, b) for b in range(128, 144)],
+                         [0] * 5 + [1] * 5 + [2] * 5 + [3])
+        small = layout_for_sak(0x08)
+        self.assertEqual([group_of(small, b) for b in range(4)], [0, 1, 2, 3])
+
+
+class TestNdef(unittest.TestCase):
+    @staticmethod
+    def _text_record(body: str = "hello card") -> bytes:
+        payload = bytes([0x02]) + b"en" + body.encode()
+        return bytes([0xD1, 0x01, len(payload), 0x54]) + payload
+
+    @staticmethod
+    def _uri_record(rest: str = "anthropic.com") -> bytes:
+        payload = bytes([0x04]) + rest.encode()       # 0x04 = https://
+        return bytes([0xD1, 0x01, len(payload), 0x55]) + payload
+
+    def test_text_record_drops_the_language_header(self):
+        from updev.mifare import parse_ndef_message
+
+        records = parse_ndef_message(self._text_record())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].text, "hello card")
+        self.assertEqual(records[0].label, "well-known · T")
+
+    def test_uri_prefix_byte_is_expanded(self):
+        from updev.mifare import parse_ndef_message
+
+        self.assertEqual(parse_ndef_message(self._uri_record())[0].text,
+                         "https://anthropic.com")
+
+    def test_the_tlv_is_found_wherever_it_sits_in_the_dump(self):
+        """Sector trailers sit in the middle of a Classic dump, so the message
+        cannot be assumed to start at a fixed offset."""
+        from updev.mifare import parse_ndef
+
+        record = self._text_record()
+        dump = bytes(48) + bytes([0x03, len(record)]) + record + b"\xfe" + bytes(16)
+        self.assertEqual(parse_ndef(dump)[0].text, "hello card")
+
+    def test_multi_record_message_stops_at_the_end_flag(self):
+        from updev.mifare import parse_ndef
+
+        text = self._text_record()
+        uri = self._uri_record()
+        chained = bytes([0x91]) + text[1:] + bytes([0x51]) + uri[1:]
+        dump = bytes([0x03, len(chained)]) + chained + b"\xfe"
+        records = parse_ndef(dump)
+        self.assertEqual([r.text for r in records],
+                         ["hello card", "https://anthropic.com"])
+
+    def test_a_truncated_dump_yields_what_it_can_without_raising(self):
+        from updev.mifare import parse_ndef, parse_ndef_message
+
+        record = self._text_record()
+        self.assertEqual(parse_ndef_message(record[:6]), [])
+        self.assertEqual(parse_ndef(bytes(64)), [])
+        self.assertEqual(parse_ndef(b"\x03"), [])
+
+    def test_ultralight_pages_zero_to_three_are_refused(self):
+        from updev.nfc import NfcError, check_page_writable
+
+        for page in range(4):
+            with self.assertRaises(NfcError):
+                check_page_writable(page)
+        self.assertIsNone(check_page_writable(4))
+
+
+@unittest.skipUnless(_has_tkinter(), "python3-tk is not installed")
+class TestUsbPanelDispatch(unittest.TestCase):
+    def _names(self, device):
+        from updev.gui.app import editors_for
+
+        return [cls.__name__ for cls in editors_for(device)]
+
+    def test_every_usb_device_gets_identity_descriptors_and_path(self):
+        """A device updev cannot place is exactly the one whose descriptor you
+        want to read, so these three are never conditional."""
+        device = Device(uid="usb:9-9", kind=Kind.USB, name="mystery", address="9-9")
+        names = self._names(device)
+        for panel in ("IdentityPanel", "DescriptorPanel", "PathPanel"):
+            self.assertIn(panel, names)
+
+    def test_a_hub_gets_its_port_map_first(self):
+        device = Device(uid="usb:usb1", kind=Kind.USB, name="root hub",
+                        address="usb1", tags=["root-hub"])
+        self.assertEqual(self._names(device)[0], "HubPanel")
+
+    def test_role_panel_leads_the_generic_ones(self):
+        from updev.gui.app import editors_for
+
+        device = Device(uid="usb:9-9", kind=Kind.USB, name="mystery", address="9-9")
+        panels = editors_for(device)
+        generic = {"IdentityPanel", "DescriptorPanel", "PathPanel", "InfoEditor"}
+        specific = [p for p in panels if p.__name__ not in generic]
+        for panel in specific:
+            self.assertLess(panels.index(panel),
+                            panels.index(next(p for p in panels
+                                              if p.__name__ in generic)))
+
+    def test_the_serial_panel_is_the_only_new_one_that_writes(self):
+        from updev.gui.usbpanels import (
+            CameraPanel,
+            DescriptorPanel,
+            HubPanel,
+            IdentityPanel,
+            NetworkPanel,
+            PathPanel,
+            SerialPanel,
+        )
+
+        self.assertTrue(SerialPanel.WRITES)       # it can transmit on the bus
+        for panel in (IdentityPanel, DescriptorPanel, PathPanel, CameraPanel,
+                      NetworkPanel, HubPanel):
+            self.assertFalse(panel.WRITES, f"{panel.__name__} claims to write")

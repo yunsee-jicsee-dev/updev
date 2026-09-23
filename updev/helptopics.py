@@ -37,8 +37,12 @@ QUICKSTART: list[tuple[str, str]] = [
     ("updev doctor", "문제 진단 + 고치는 명령까지"),
     ("updev watch", "라이브 대시보드"),
     ("updev activity", "착탈 이벤트 실시간 로그"),
-    ("updev usb zone", "USB 꽂으면 뭔지 판정해주는 체험존"),
+    ("updev usb zone", "USB 꽂으면 뭔지 판정하고 맞는 툴까지 주는 체험존"),
+    ("updev tools", "지금 붙어있는 걸로 뭘 할 수 있는지"),
+    ("updev nfc wiring", "점퍼선 NFC 리더 배선표"),
+    ("updev gui", "기기별 에디터 GUI"),
     ("updev tree", "물리적 연결 구조"),
+    ("updev panel boot", "ST7735S에 부팅 상태 표시"),
 ]
 
 
@@ -65,6 +69,75 @@ TOPICS: list[Topic] = [
             ("updev tree", "물리적 토폴로지"),
             ("updev backends", "백엔드별 상태와 소요시간"),
             ("updev export out.json", "전체 인벤토리 파일로"),
+        ],
+    ),
+    Topic(
+        name="tools",
+        title="판정 다음에 오는 것",
+        blurb="뭔지 알아냈으면, 그걸로 뭘 하나",
+        body=(
+            "updev는 장치가 뭔지 판정하고 거기서 멈추지 않는다. 판정 결과마다 "
+            "실제로 실행할 수 있는 명령이 붙는다. `updev usb zone`은 꽂는 순간 "
+            "이 둘을 같이 보여주고, `updev tools`는 같은 걸 화면 안 잡고 "
+            "출력한다.\n\n"
+            "플로피 툴(`updev floppy`)은 1.44MB 이미지를 쓰는 물건이라 FUSB "
+            "에서만 대표 툴이 된다. 나머지는 각자 맞는 게 따로 붙는다:\n\n"
+            "  NUSB·HUSB·SUSB  실제 읽기 속도 + 랜덤 접근 지연 측정\n"
+            "  ODD             디스크 상태\n"
+            "  카메라           camtoy · v4l2 포맷 목록\n"
+            "  키보드·마우스     evdev 이벤트 실시간\n"
+            "  시리얼           포트 열어서 흘려보기\n"
+            "  무선랜·유선랜     그 인터페이스로 서브넷 스윕\n"
+            "  휴대폰           ADB 연결 확인\n"
+            "  허브             아래쪽 속도·병목\n"
+            "  I2C·SPI 칩       그 백엔드가 붙여둔 명령 + NFC 리더 확인\n\n"
+            "★ 표시가 그 장치의 대표 툴이다. 설치가 필요한 명령은 목록에 "
+            "남되 뭘 깔아야 하는지 같이 나온다. 매체를 덮어쓰는 명령은 "
+            "'덮어씀'으로 표시되고 updev가 대신 실행하지 않는다."
+        ),
+        commands=[
+            ("updev usb zone", "꽂으면 판정 + 툴 (라이브)"),
+            ("updev tools", "붙어있는 것 전부"),
+            ("updev tools 3-2", "하나만"),
+            ("updev tools --brief", "한 줄씩"),
+            ("updev --json tools", "그대로 파이프로"),
+        ],
+    ),
+    Topic(
+        name="gui",
+        title="기기별 에디터 GUI",
+        blurb="장치를 고르면 그 장치의 속을 여는 창",
+        body=(
+            "`updev gui` 는 왼쪽에 `updev scan` 과 같은 목록, 오른쪽에 그 장치의 "
+            "에디터를 띄운다. 장치를 앞에 써도 된다 — `updev 3-2 gui`.\n\n"
+            "  USB 플로피 (FUSB)   FAT12 에디터 — 파일·부트섹터 고쳐서 다시 굽기\n"
+            "  NFC 리더            태그 에디터 — 전체 덤프·접근조건·NDEF·블록 쓰기\n"
+            "  블록 장치            섹터 뷰어 (읽기 전용)\n"
+            "  I2C 칩              레지스터 에디터\n"
+            "  GPIO                핀 에디터 (출력은 잠금 해제 후)\n"
+            "  키보드·마우스        evdev 이벤트 실시간\n"
+            "  카메라               포맷 목록 + 한 장 찍기\n"
+            "  USB 시리얼           터미널 (보기 + 한 줄 보내기)\n"
+            "  무선랜·유선랜         링크 정보 + 서브넷 훑기\n"
+            "  허브                 포트별로 뭐가 걸렸고 뭘 협상했는지\n"
+            "  그 외 전부           장치 정보 + 실행할 수 있는 명령\n\n"
+            "USB 장치에는 역할별 패널 뒤에 항상 세 개가 더 붙는다 — 정체(판정 "
+            "근거), 디스크립터(장치가 말하는 그대로), 경로(병목). 자리를 못 잡는 "
+            "장치야말로 디스크립터를 읽어봐야 하는 장치라서 조건부가 아니다.\n\n"
+            "한 장치에 패널이 여러 개면 탭으로 다 준다. USB 플로피는 FAT12 "
+            "디스크이면서 블록 장치라, 둘 다 열린다.\n\n"
+            "쓰기 규칙은 터미널과 같다. CLI가 --yes를 요구하는 자리에서 창은 "
+            "나가는 바이트를 전부 보여주는 확인 창을 띄우고, 기본값은 항상 "
+            "'아니오'다. 마운트된 디스크의 섹터 쓰기처럼 고칠 방법이 없는 건 "
+            "아예 만들지 않았다.\n\n"
+            "tkinter만 쓴다 — 파이 OS에 이미 있고, 따로 깔 게 없다. 디스플레이가 "
+            "없으면 이유를 말하고 `updev tools`를 안내한다."
+        ),
+        commands=[
+            ("updev gui", "전부 훑어보기"),
+            ("updev gui 3-2", "이 장치로 바로"),
+            ("updev 3-2 gui", "장치를 앞에 써도 된다"),
+            ("updev tools", "같은 걸 터미널에서"),
         ],
     ),
     Topic(
@@ -182,6 +255,40 @@ TOPICS: list[Topic] = [
         ],
     ),
     Topic(
+        name="nfc",
+        title="NFC 리더 (점퍼선)",
+        blurb="RC522 · PN532를 40핀에 물려서 태그 읽기",
+        body=(
+            "USB NFC 리더는 자기가 뭔지 밝히지만, 점퍼선으로 무는 모듈은 "
+            "아무것도 밝히지 않는다. SPI에는 열거라는 게 없고 I2C에는 고정 "
+            "주소 하나뿐이다. 그래서 순서가 반대다 — 먼저 배선표를 보고, "
+            "물리고, 그 다음에 물어본다.\n\n"
+            "MFRC522는 SPI 전용이고 RST 선이 필수다. PN532는 DIP 스위치로 "
+            "I2C·SPI·HSU 중 하나가 되는데, 스위치와 실제 배선이 다르면 "
+            "조용히 아무 대답도 안 한다. PN532의 SPI는 LSB first라 파이 "
+            "컨트롤러로는 못 맞추고, updev가 바이트를 뒤집어서 보낸다.\n\n"
+            "CLI는 읽기만 한다 — UID·ATQA·SAK와 섹터 덤프. 쓰기는 GUI 태그 "
+            "에디터에만 있고(`updev gui`), 거기서도 block 0과 섹터 트레일러는 "
+            "막혀 있다. 트레일러의 접근 비트를 잘못 쓰면 그 섹터는 영구히 "
+            "잠기기 때문이다.\n\n"
+            "에디터는 섹터마다 접근 비트(C1/C2/C3)를 풀어서 어느 블록을 어느 "
+            "키로 읽고 쓸 수 있는지 보여주고, NDEF 레코드를 해독하고, 덤프를 "
+            ".mfd 파일로 저장하거나 연다.\n\n"
+            "SPI는 주소가 없어서 CE0에 뭐가 물려있든 그 바이트를 본다. "
+            "그래서 일반 스캔은 SPI를 건드리지 않고, --deep이나 "
+            "`updev nfc detect`로 명시했을 때만 물어본다."
+        ),
+        commands=[
+            ("updev nfc wiring", "모듈별 배선표 — 어느 핀에 뭘"),
+            ("updev nfc wiring rc522", "하나만"),
+            ("updev nfc detect -v", "붙었는지 확인 (조용한 버스까지)"),
+            ("updev nfc read", "태그 하나 읽기"),
+            ("updev nfc poll", "올릴 때마다 한 줄 — NFC판 체험존"),
+            ("updev nfc dump --sector 1", "MIFARE Classic 섹터 덤프"),
+            ("updev gui", "태그 에디터 — 전체 덤프·접근조건·NDEF·편집"),
+        ],
+    ),
+    Topic(
         name="network",
         title="네트워크",
         blurb="인터페이스 + LAN 스윕",
@@ -240,6 +347,37 @@ TOPICS: list[Topic] = [
         commands=[
             ("updev i2c write ... --yes", "쓰기는 --yes 필수"),
             ("updev spi xfer ... --yes", "송신은 --yes 필수"),
+        ],
+    ),
+    Topic(
+        name="panel",
+        title="ST7735S 프론트 패널",
+        blurb="스캔 결과를 물리 디스플레이에 띄우기",
+        body=(
+            "128x160 ST7735S를 updev의 세 번째 프론트엔드로 쓴다. CLI는 터미널에, "
+            "`updev gui`는 Tk에, `updev panel`은 유리 위에 같은 스캔을 그린다.\n\n"
+            "`updev panel boot`는 화면 세 개를 순서대로 보여준다. 스플래시(스캔 "
+            "전에 바로 뜬다), 백엔드별 진행 상황(리포트가 도착할 때마다 한 줄씩 "
+            "채워진다), 그리고 요약. 진행 화면이 핵심이다 — 버스 하나가 멎으면 "
+            "끝까지 채워지지 않는 줄이 범인을 지목한다.\n\n"
+            "요약 화면은 프로세스가 끝나도 그대로 남는다. 부팅 때 한 번 돌려두면 "
+            "아무것도 실행하지 않은 채로 상태판이 된다 — "
+            "`./install.sh --panel-service` 가 systemd 유닛을 만들어 등록한다. "
+            "updev 가 어디 설치돼 있는지(체크아웃이냐 --user 휠이냐)에 따라 "
+            "실행 경로가 달라지므로 유닛은 설치 시점에 생성된다.\n\n"
+            "배선: VCC→3V3, GND→GND, SCL→GPIO11, SDA→GPIO10, RES→GPIO25, "
+            "DC→GPIO24, CS→GPIO8(CE0), BLK→3V3.\n\n"
+            "주의: 패널은 SPI0 CE0에 물려 있고 그 SPI0는 updev가 보고하는 버스이기도 "
+            "하다. 패널이 그리는 동안 SPI0는 패널 자신 때문에 바쁘다. 실제로 "
+            "관찰하고 싶은 장치는 CE1이나 SPI1로 분리해야 한다."
+        ),
+        commands=[
+            ("updev panel test", "컬러바 + 모서리 마크 — 배선/BGR 확인"),
+            ("updev panel boot", "스플래시 → 진행 → 요약"),
+            ("updev panel boot --capture ~/frames", "PNG로도 저장 (패널 없이 확인)"),
+            ("updev panel boot --bgr", "빨강/파랑이 바뀌어 보이면"),
+            ("updev panel off", "화면 지우고 놓아주기"),
+            ("./install.sh --panel-service", "부팅 시 자동 실행 등록"),
         ],
     ),
     Topic(

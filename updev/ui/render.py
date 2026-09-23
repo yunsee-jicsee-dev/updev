@@ -70,6 +70,7 @@ KIND_STYLE: dict[Kind, str] = {
     Kind.USB: "bright_cyan",
     Kind.I2C: "bright_green",
     Kind.SPI: "green",
+    Kind.NFC: "bright_red",
     Kind.SERIAL: "bright_yellow",
     Kind.CAMERA: "bright_magenta",
     Kind.GPIO: "cyan",
@@ -89,6 +90,7 @@ KIND_TITLE: dict[Kind, str] = {
     Kind.USB: "USB",
     Kind.I2C: "I2C",
     Kind.SPI: "SPI",
+    Kind.NFC: "NFC",
     Kind.SERIAL: "Serial / UART",
     Kind.CAMERA: "Camera",
     Kind.GPIO: "GPIO",
@@ -102,7 +104,7 @@ KIND_TITLE: dict[Kind, str] = {
 # The order sections appear in `updev scan`.
 KIND_ORDER: tuple[Kind, ...] = (
     Kind.HOST, Kind.SOC, Kind.POWER, Kind.THERMAL, Kind.STORAGE, Kind.USB,
-    Kind.I2C, Kind.SPI, Kind.SERIAL, Kind.CAMERA, Kind.GPIO,
+    Kind.I2C, Kind.SPI, Kind.NFC, Kind.SERIAL, Kind.CAMERA, Kind.GPIO,
     Kind.NET_IFACE, Kind.NET_HOST, Kind.BLUETOOTH, Kind.DISPLAY, Kind.UNKNOWN,
 )
 

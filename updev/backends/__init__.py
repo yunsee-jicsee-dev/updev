@@ -14,6 +14,7 @@ from .gpio import GpioBackend
 from .host import HostBackend
 from .i2c import I2cBackend
 from .network import LanBackend, NetworkBackend
+from .nfc import NfcBackend
 from .serial_ import SerialBackend
 from .spi import SpiBackend
 from .storage import StorageBackend
@@ -25,6 +26,7 @@ BACKEND_CLASSES: tuple[type[Backend], ...] = (
     UsbBackend,
     I2cBackend,
     SpiBackend,
+    NfcBackend,
     SerialBackend,
     CameraBackend,
     DisplayBackend,

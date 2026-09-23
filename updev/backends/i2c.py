@@ -45,6 +45,7 @@ KNOWN_ADDRESSES: dict[int, str] = {
     0x20: "PCF8574 / MCP23017 GPIO expander",
     0x21: "PCF8574 / MCP23017 GPIO expander",
     0x23: "BH1750 light sensor",
+    0x24: "PN532 NFC reader (updev nfc detect)",
     0x27: "PCF8574 LCD backpack",
     0x28: "BNO055 IMU",
     0x29: "VL53L0X ToF / TSL2591",

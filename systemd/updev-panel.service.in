@@ -1,0 +1,33 @@
+# updev front panel — draw the boot summary on the ST7735S at startup.
+#
+# A template, not a finished unit: @EXEC@, @USER@ and @WORKDIR@ are filled in
+# by `./install.sh --panel-service`, because where `updev` actually lives
+# depends on how it was installed (a checkout, or a --user wheel in
+# ~/.local/bin). Hardcoding a path here is how the first version of this file
+# got it wrong.
+#
+# It runs as a normal user, not root: a `pip install --user` wheel is not on
+# root's import path, and the spi and gpio groups already grant everything the
+# panel needs. Check with `id -nG` that the user is in both.
+#
+# This is not an early-boot splash. It runs once the system is up, because
+# what it shows is what updev *found*, and finding it needs the buses and the
+# network to exist.
+
+[Unit]
+Description=updev front panel (ST7735S boot screen)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+WorkingDirectory=@WORKDIR@
+ExecStart=@EXEC@ panel boot
+# Clear the panel on shutdown rather than leaving a stale summary on it.
+ExecStop=@EXEC@ panel off
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

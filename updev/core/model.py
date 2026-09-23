@@ -24,6 +24,7 @@ class Kind(StrEnum):
     USB = "usb"
     I2C = "i2c"
     SPI = "spi"
+    NFC = "nfc"
     SERIAL = "serial"
     CAMERA = "camera"
     GPIO = "gpio"
