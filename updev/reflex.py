@@ -150,6 +150,12 @@ def why_not(reflex: Reflex, verdict, previous_state: str, now: float = 0.0) -> s
         channels = ", ".join(sorted({a.channel for a in verdict.alarms}))
         return f"측면뿔 경보 중({channels}) — 경보 상태에서는 어떤 반사도 실행하지 않습니다"
 
+    if getattr(verdict, "calm", False):
+        # Someone said they are working on the board. Every state change in a
+        # maintenance window is something they did, and firing a reflex at
+        # their own hands is the opposite of helpful.
+        return "진정 중 — 정비 창이 열려 있는 동안에는 반사가 돌지 않습니다"
+
     recognition = verdict.recognition
     if recognition.label != reflex.state:
         return ""                    # not this reflex's state; not a refusal

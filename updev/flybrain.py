@@ -551,6 +551,7 @@ def smell(result: ScanResult) -> Percept:
 class Mood(StrEnum):
     """What the fly decides to do about a scan."""
 
+    CALM = "calm"            # you said you were working on it; surprise is off
     SETTLED = "settled"      # familiar and benign — nothing to do
     CURIOUS = "curious"      # mildly novel — worth a closer look
     DRIFTED = "drifted"      # the board it has always been, but not lately
@@ -560,6 +561,7 @@ class Mood(StrEnum):
 
 
 MOOD_LABEL: dict[Mood, str] = {
+    Mood.CALM: "진정 — 정비 중, 놀라지 않음",
     Mood.SETTLED: "익숙함 — 평소의 이 보드",
     Mood.CURIOUS: "조금 낯섦 — 살펴볼 만함",
     Mood.DRIFTED: "달라짐 — 이 보드는 맞는데 최근 모습이 아님",
@@ -569,6 +571,7 @@ MOOD_LABEL: dict[Mood, str] = {
 }
 
 MOOD_STYLE: dict[Mood, str] = {
+    Mood.CALM: "blue",
     Mood.SETTLED: "green",
     Mood.CURIOUS: "cyan",
     Mood.DRIFTED: "yellow",
@@ -699,6 +702,10 @@ class Verdict:
     #: which case `drift` is withheld rather than guessed at. See STALE_RETENTION.
     recent_fresh: bool = True
 
+    #: True while a maintenance window is open. Learned surprise is held back;
+    #: the alarms below are not.
+    calm: bool = False
+
     @property
     def drift(self) -> float:
         """How much more novel this is to the short term than the long term.
@@ -724,6 +731,7 @@ class Verdict:
         return {
             "mood": str(self.mood),
             "label": self.label,
+            "calm": self.calm,
             "novelty": round(self.novelty, 4),
             "aversion": round(self.aversion, 4),
             "drift": round(self.drift, 4),
@@ -828,6 +836,20 @@ class FlyBrain:
     updated: float = 0.0
     signature: str = field(default_factory=glomerulus_signature)
 
+    #: A window during which self-inflicted change is not a surprise.
+    #:
+    #: Unplugging things is how a person works on a board, and every one of
+    #: those is novel by construction — so the fly spends a maintenance
+    #: session startled at consequences of the maintenance. Animals do not
+    #: work this way: a sensation you caused yourself is suppressed, which is
+    #: why self-tickling does not work. This is that, declared rather than
+    #: inferred, because the fly cannot see a pair of hands.
+    #:
+    #: It silences *learned* surprise only. The lateral horn is untouched and
+    #: must stay that way — a calm signal that could mute a full root
+    #: filesystem would undo the one guarantee this circuit makes.
+    calm_until: float = 0.0
+
     #: Why this brain hatched empty, when it did so by discarding something.
     #: Not persisted — it describes this load, not the memory. A fly that
     #: silently forgets everything looks broken; one that says the receptors
@@ -853,6 +875,12 @@ class FlyBrain:
     extra_states: dict[str, Any] = field(default_factory=dict)
 
     # -- readout -----------------------------------------------------------
+
+    def calm(self, now: float | None = None) -> bool:
+        return self.calm_until > (now if now is not None else time.time())
+
+    def calm_left(self, now: float | None = None) -> float:
+        return max(0.0, self.calm_until - (now if now is not None else time.time()))
 
     def _elapsed(self, now: float | None = None) -> float:
         """Seconds of forgetting owed since the last write."""
@@ -915,8 +943,14 @@ class FlyBrain:
         short = self.compartments.get(RECENT)
         fresh = bool(short) and short.retention(self._elapsed()) >= STALE_RETENTION
 
+        calm = self.calm()
         if alarms:
             mood = Mood.ALARMED
+        elif calm:
+            # Everything below this line is learned surprise, and the person
+            # has said the surprise is theirs. The branch sits under `alarms`
+            # and not above it on purpose.
+            mood = Mood.CALM
         elif aversion >= 0.35:
             mood = Mood.AVERSIVE
         elif novelty >= 0.6:
@@ -940,6 +974,7 @@ class FlyBrain:
             compartments=novelties,
             recognition=self.recognize(percept),
             recent_fresh=fresh,
+            calm=calm,
             alarms=alarms,
             attend=self._attend(percept),
         )
@@ -1021,6 +1056,7 @@ class FlyBrain:
         if state:
             return self.states.pop(state, None) is not None
         self.compartments = _fresh_compartments()
+        self.calm_until = 0.0
         self.aversive.clear()
         self.states.clear()
         self.exposures = 0
@@ -1059,6 +1095,8 @@ class FlyBrain:
             "updated": self.updated,
             "signature": self.signature,
             "stale": self.signature != glomerulus_signature(),
+            "calm": self.calm(),
+            "calm_left": round(self.calm_left(), 1),
         }
 
     # -- persistence -------------------------------------------------------
@@ -1070,6 +1108,7 @@ class FlyBrain:
             "signature": self.signature,
             "glomeruli": list(GLOMERULI),
             "last_action": self.last_action,
+            "calm_until": self.calm_until,
             "wiring_seed": WIRING_SEED,
             "kenyon_cells": KENYON_CELLS,
             "exposures": self.exposures,
@@ -1093,8 +1132,13 @@ class FlyBrain:
         One step of history, because teaching the wrong thing is easy and
         silent — a mount that did not happen, a shell line with || where &&
         was meant — and without this the only way back is to forget the state
-        entirely and start it over. One step is enough: the mistake is noticed
-        immediately or not at all.
+        entirely and start it over.
+
+        The step is one *save*, not one lesson, and those differ: `learn -n 20`
+        loads once, learns twenty times in memory and writes once, so undoing
+        it discards all twenty. That is the right behaviour — the write is the
+        thing that happened — but it is not what "undo the last lesson" sounds
+        like, so the caller is told how many exposures it is about to drop.
         """
         path = path or brain_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1115,7 +1159,7 @@ class FlyBrain:
     _OWNED = frozenset({
         "version", "signature", "wiring_seed", "kenyon_cells", "exposures",
         "created", "updated", "compartments", "aversive", "states", "familiar",
-        "glomeruli", "last_action",
+        "glomeruli", "last_action", "calm_until",
     })
 
     @staticmethod
@@ -1160,6 +1204,7 @@ class FlyBrain:
             updated=_as_float(data.get("updated"), 0.0),
             signature=str(data.get("signature") or ""),
         )
+        brain.calm_until = _as_float(data.get("calm_until"), 0.0)
         last = data.get("last_action")
         brain.last_action = last if isinstance(last, dict) else {}
         brain.extra = {k: v for k, v in data.items() if k not in cls._OWNED}

@@ -1537,6 +1537,66 @@ def confirm_target(brain, recognition, state_name: str, anyway: bool):
     return recognition.label, ""
 
 
+@fly.command("calm")
+@click.argument("duration", required=False, default="10m")
+@click.option("--off", is_flag=True, help="End the window now.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_calm(state: State, duration, off, path):
+    """정비 중이라고 알려 놀라지 않게 한다 — 기본 10분.
+
+    Unplugging things is how you work on a board, and every one of those reads
+    as novel. Without this the fly spends a maintenance session startled at
+    the maintenance. Animals suppress sensation they caused themselves; this
+    is the same thing, declared out loud because the fly cannot see hands.
+
+    It holds back learned surprise and stops reflexes firing. It does not
+    touch the lateral horn: a full disk or a dead backend still alarms, and a
+    calm signal that could mute those would undo the only guarantee here.
+
+    DURATION accepts 30s, 10m, 2h.
+    """
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+
+    if off:
+        brain.calm_until = 0.0
+        brain.save(target)
+        state.console.print("[dim]정비 창을 닫았습니다 — 다시 놀랍니다.[/dim]")
+        return
+
+    seconds = _parse_duration(duration)
+    if seconds <= 0:
+        raise click.ClickException(f"기간을 알 수 없습니다: {duration} (예: 30s, 10m, 2h)")
+    brain.calm_until = time.time() + seconds
+    brain.save(target)
+
+    if state.as_json:
+        state.emit({"calm_until": brain.calm_until, "seconds": seconds})
+        return
+    until = time.strftime("%H:%M:%S", time.localtime(brain.calm_until))
+    state.console.print(
+        f"[bold blue]진정 — {until} 까지 놀라지 않습니다.[/bold blue]")
+    state.console.print(
+        "[dim]측면뿔은 그대로입니다. 디스크가 꽉 차거나 백엔드가 죽으면 "
+        "여전히 경보합니다.  일찍 끝내려면: updev fly calm --off[/dim]")
+
+
+def _parse_duration(text: str) -> float:
+    """30s / 10m / 2h / a bare number of seconds."""
+    text = (text or "").strip().lower()
+    if not text:
+        return 0.0
+    unit = {"s": 1, "m": 60, "h": 3600}.get(text[-1])
+    try:
+        return float(text[:-1]) * unit if unit else float(text)
+    except ValueError:
+        return 0.0
+
+
 @fly.command("undo")
 @click.option("--brain", "path", type=click.Path(dir_okay=False),
               help="Use this memory file instead of the default.")
@@ -1545,9 +1605,11 @@ def fly_undo(state: State, path):
     """방금 가르친 것을 취소한다 — "말실수 했음".
 
     Every write keeps the version it replaced, so the last `learn` or `yes`
-    can be taken back. One step only: a mistaken lesson is noticed straight
-    away or not at all, and a deeper history would mostly be a way to restore
-    something older than the thing you meant.
+    can be taken back.
+
+    One *save*, which is not always one lesson: `learn -n 20` writes once and
+    undoing it drops all twenty. The count is printed before and after so the
+    size of the step is never a surprise.
     """
     import shutil
 
@@ -1560,7 +1622,9 @@ def fly_undo(state: State, path):
             f"되돌릴 판본이 없습니다 — {prev.name} 이 아직 만들어지지 않았습니다.\n"
             "저장이 한 번이라도 일어난 뒤에야 직전 상태가 생깁니다.")
 
-    undone = load_brain(target).last_action
+    current = load_brain(target)
+    undone = current.last_action
+    before_count = current.exposures
     shutil.copyfile(prev, target)
     from .flybrain import _restore_ownership
 
@@ -1572,9 +1636,12 @@ def fly_undo(state: State, path):
         return
 
     what = undone.get("state") or "(이름 없는 학습)"
-    state.console.print(f"[yellow]되돌렸습니다 — 직전 학습 '{what}' 취소[/yellow]")
+    dropped = before_count - now.exposures
     state.console.print(
-        f"[dim]누적 {now.exposures}회 · 상태 {sorted(now.states) or '없음'} · {target}[/dim]")
+        f"[yellow]되돌렸습니다 — 직전 저장 '{what}' 취소, 학습 {dropped}회 버림[/yellow]")
+    state.console.print(
+        f"[dim]누적 {before_count} → {now.exposures}회 · "
+        f"상태 {sorted(now.states) or '없음'} · {target}[/dim]")
 
 
 @fly.command("yes")

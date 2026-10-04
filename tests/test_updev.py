@@ -4271,3 +4271,99 @@ class TestReadingFilesOffTheDisk(unittest.TestCase):
         entry = max(medium.files, key=lambda e: e["size"])
         self.path.write_bytes(self.path.read_bytes()[:SYSTEM_SECTORS * SECTOR])
         self.assertEqual(read_file(str(self.path), entry, medium.system), b"")
+
+
+class TestCalmWindow(_FlyFixture):
+    """Saying "that was me" so the fly stops being startled by your hands.
+
+    Every change during maintenance is novel by construction, so without this
+    a session spent unplugging things is a session spent startled at the
+    unplugging. The important half is what it does *not* silence.
+    """
+
+    def _broken(self):
+        result = self._board()
+        result.devices[0].issue(Severity.ERROR, "루트 파일시스템이 꽉 찼습니다")
+        return result
+
+    def _calm_brain(self, seconds=300):
+        import time
+
+        from updev.flybrain import FlyBrain
+
+        brain = FlyBrain()
+        brain.calm_until = time.time() + seconds
+        return brain
+
+    def test_a_novel_board_is_startling_by_default(self):
+        from updev.flybrain import FlyBrain, Mood
+
+        self.assertEqual(FlyBrain().judge(self._board()).mood, Mood.STARTLED)
+
+    def test_the_same_board_is_calm_inside_the_window(self):
+        from updev.flybrain import Mood
+
+        verdict = self._calm_brain().judge(self._board())
+        self.assertEqual(verdict.mood, Mood.CALM)
+        self.assertTrue(verdict.calm)
+
+    def test_the_lateral_horn_outranks_calm(self):
+        """The guarantee this whole circuit rests on. A calm signal that could
+        mute a full root filesystem would undo it."""
+        from updev.flybrain import Mood
+
+        verdict = self._calm_brain().judge(self._broken())
+        self.assertEqual(verdict.mood, Mood.ALARMED)
+        self.assertTrue(verdict.alarms)
+
+    def test_an_expired_window_is_not_calm(self):
+        import time
+
+        from updev.flybrain import Mood
+
+        brain = self._calm_brain()
+        brain.calm_until = time.time() - 1
+        self.assertFalse(brain.calm())
+        self.assertNotEqual(brain.judge(self._board()).mood, Mood.CALM)
+
+    def test_calm_survives_a_save(self):
+        import tempfile
+        from pathlib import Path
+
+        from updev.flybrain import load_brain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "b.json"
+            self._calm_brain().save(path)
+            self.assertTrue(load_brain(path).calm())
+
+    def test_forgetting_everything_also_ends_the_window(self):
+        brain = self._calm_brain()
+        brain.forget()
+        self.assertFalse(brain.calm())
+
+    def test_reflexes_do_not_fire_while_calm(self):
+        """Firing a reflex at the operator's own hands is the opposite of
+        helpful."""
+        from updev.reflex import ReflexBook, why_not
+
+        book = ReflexBook()
+        book.teach("idle", "true")
+        book.arm("idle")
+
+        class _R:
+            label, confident, margin = "idle", True, 0.3
+
+        class _V:
+            recognition, alarms, calm = _R(), [], True
+
+        self.assertIn("진정 중", why_not(book.reflexes["idle"], _V(), ""))
+
+    def test_durations_parse(self):
+        from updev.cli import _parse_duration
+
+        self.assertEqual(_parse_duration("30s"), 30)
+        self.assertEqual(_parse_duration("10m"), 600)
+        self.assertEqual(_parse_duration("2h"), 7200)
+        self.assertEqual(_parse_duration("90"), 90)
+        self.assertEqual(_parse_duration("nonsense"), 0)
