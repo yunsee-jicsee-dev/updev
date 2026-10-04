@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "updev"
-version = "1.0.0"
+version = "1.1.0"
 description = "One device manager for the whole board: LAN, USB, I2C, SPI, serial, cameras, GPIO, storage and the Raspberry Pi itself."
 readme = "README.md"
 requires-python = ">=3.11"

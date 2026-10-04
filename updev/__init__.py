@@ -5,7 +5,7 @@ cameras and storage, the network interfaces and the neighbours on the LAN —
 all through one model, one CLI and one live dashboard.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .core.model import Device, Kind, ScanResult, Severity, Status
 from .core.registry import ProbeContext, Scanner, build_scanner

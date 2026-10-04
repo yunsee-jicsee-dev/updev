@@ -69,7 +69,7 @@ pass_state = click.make_pass_decorator(State, ensure=True)
 @click.option("-x", "--exclude", "excluded", multiple=True,
               help="Skip these backends (repeatable).")
 @click.option("--width", type=int, default=None, help="Force output width.")
-@click.version_option("1.0.0", "-V", "--version", prog_name="updev")
+@click.version_option("1.1.0", "-V", "--version", prog_name="updev")
 @click.pass_context
 def cli(ctx, as_json, no_color, deep, timeout, backends, excluded, width):
     """updev — one device manager for the whole board.

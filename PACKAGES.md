@@ -23,7 +23,7 @@ sudo apt install iproute2 iputils-ping iw bluez util-linux \
                  v4l-utils usb.ids pci.ids udev
 
 # 4. updev 설치
-pip install --user dist/updev-1.0.0-py3-none-any.whl
+pip install --user dist/updev-1.1.0-py3-none-any.whl
 ```
 
 설치 없이 그냥 쓰려면 `bin/updev`로 바로 실행해도 된다.
@@ -133,8 +133,8 @@ sudo reboot
 ## 4. 휠
 
 ```
-dist/updev-1.0.0-py3-none-any.whl      # 순수 파이썬, 아키텍처 무관
-dist/updev-1.0.0.tar.gz                # 소스 배포본
+dist/updev-1.1.0-py3-none-any.whl      # 순수 파이썬, 아키텍처 무관
+dist/updev-1.1.0.tar.gz                # 소스 배포본
 ```
 
 ### 빌드
@@ -149,8 +149,8 @@ python3 -m pip wheel . --no-deps --no-build-isolation -w dist/
 ### 설치
 
 ```bash
-pip install --user dist/updev-1.0.0-py3-none-any.whl        # 사용자 홈에
-pipx install dist/updev-1.0.0-py3-none-any.whl              # 격리 설치 (pipx 필요)
+pip install --user dist/updev-1.1.0-py3-none-any.whl        # 사용자 홈에
+pipx install dist/updev-1.1.0-py3-none-any.whl              # 격리 설치 (pipx 필요)
 ```
 
 > 시스템 파이썬이 **externally-managed**라 `sudo pip install`은 거부된다.
@@ -160,7 +160,7 @@ venv에 넣을 때는 apt로 깔린 하드웨어 라이브러리를 보이게 �
 
 ```bash
 python3 -m venv --system-site-packages .venv
-.venv/bin/pip install dist/updev-1.0.0-py3-none-any.whl
+.venv/bin/pip install dist/updev-1.1.0-py3-none-any.whl
 ```
 
 `--system-site-packages` 없이 만들면 `picamera2`·`spidev`·`lgpio`가 안 보여서
@@ -172,7 +172,7 @@ python3 -m venv --system-site-packages .venv
 
 ```bash
 pip download -d wheels/ rich click psutil smbus2 spidev pyserial lgpio Pillow
-pip install --user --no-index --find-links wheels/ dist/updev-1.0.0-py3-none-any.whl
+pip install --user --no-index --find-links wheels/ dist/updev-1.1.0-py3-none-any.whl
 ```
 
 `wheels/`는 `.gitignore`에 있으니 저장소에 딸려가지 않는다.
