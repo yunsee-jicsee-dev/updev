@@ -12,7 +12,7 @@ tiny, it runs offline, and it learns from a handful of examples.
 
 The circuit, as the connectome maps it, and what each stage does here:
 
-    receptor neurons  →  51 glomeruli        one per feature of the scan
+    receptor neurons  →  52 glomeruli        one per feature of the scan
               ↓            (antennal lobe)   divisive gain control
     projection neurons →  concentration-invariant code
               ↓
@@ -85,6 +85,13 @@ __all__ = [
 # --------------------------------------------------------------------------
 
 #: Glomeruli in the antennal lobe — the fly's input channels.
+#:
+#: A fact about flies, not a budget for this file. The receptor list below sat
+#: at exactly 51 for a while and it was satisfying, but keeping it there meant
+#: weighing a real signal against a coincidence — and the first time that
+#: happened the candidates for eviction were `nvme` and `sd-card`, which are
+#: silent on this board and would be the only thing the fly could smell on
+#: someone else's. The count now follows the work.
 ANTENNAL_LOBE_GLOMERULI = 51
 
 #: Kenyon cells in the mushroom body. Commonly cited as ~2,000 per hemisphere.
@@ -93,6 +100,23 @@ KENYON_CELLS = 2_000
 #: Glomeruli each Kenyon cell samples ("claws"). Measured mean is about 6,
 #: and — importantly — the sampling is random rather than stereotyped.
 CLAWS_PER_KENYON_CELL = 6
+
+#: Receptor slots the Kenyon cells are wired to, as opposed to receptors that
+#: currently exist.
+#:
+#: This is the fix for a design fault that cost two rounds of retraining. The
+#: claws used to be drawn as `rand % len(GLOMERULI)`, so adding a single new
+#: receptor renumbered every claw in the mushroom body and invalidated every
+#: trained weight. Each new thing the fly could learn to smell destroyed
+#: everything it had already learned — which makes adding one a bad trade, and
+#: that is exactly backwards.
+#:
+#: Wiring to a fixed slot count instead decouples the two. Glomeruli occupy
+#: slots 0..n-1 in append-only order; the rest read as zero and contribute
+#: nothing. A new receptor takes the next free slot and every existing claw
+#: still points where it did, so old training stays valid and simply does not
+#: know about the new channel yet.
+GLOM_SLOTS = 64
 
 #: Fraction of Kenyon cells that survive APL inhibition for any one odour.
 #: The sparseness is enforced by a single giant inhibitory neuron per
@@ -237,7 +261,7 @@ def _fresh_compartments() -> dict[str, Compartment]:
 #: things this could not.
 _TAG_GLOMERULI = (
     "hotplug", "storage", "input", "camera", "hub", "root-hub",
-    "nvme", "sd-card", "read-only", "FUSB", "wifi",
+    "nvme", "sd-card", "read-only", "FUSB", "wireless",
 )
 
 _BUS_GLOMERULI = ("usb", "i2c", "spi", "serial", "net", "block")
@@ -257,7 +281,7 @@ def _build_glomeruli() -> tuple[str, ...]:
     names += [f"bus:{b}" for b in _BUS_GLOMERULI]
     names += ["census:population", "census:issues", "census:backends-down"]
     names += ["state:usb-degraded", "state:fs-pressure", "state:thermal",
-              "state:empty-bay"]
+              "state:empty-bay", "state:disk-read", "state:mounted"]
     return tuple(names)
 
 
@@ -265,14 +289,26 @@ GLOMERULI: tuple[str, ...] = _build_glomeruli()
 
 
 def glomerulus_signature() -> str:
-    """Stable fingerprint of the input layer, stored with a trained memory.
-
-    A memory trained against a different set of glomeruli is not wrong so much
-    as meaningless — the bits no longer refer to the same things.
-    """
+    """Stable fingerprint of the input layer, stored with a trained memory."""
     import hashlib
 
     return hashlib.sha256("\n".join(GLOMERULI).encode()).hexdigest()[:16]
+
+
+def compatible_layer(stored: list[str]) -> bool:
+    """Can weights trained against `stored` still be read?
+
+    Yes when `stored` is a prefix of the current list: every receptor it knew
+    about still sits in the same slot, and the ones added since occupy slots
+    it never learned anything about. Its weights stay true — merely incomplete,
+    which is the ordinary state of a memory anyway.
+
+    No when a name changed or moved, because then a slot means something it
+    did not mean when the weight was written.
+    """
+    if not stored:
+        return False
+    return len(stored) <= len(GLOMERULI) and list(GLOMERULI[:len(stored)]) == stored
 
 
 # --------------------------------------------------------------------------
@@ -332,17 +368,63 @@ def _raw_activation(result: ScanResult) -> dict[str, float]:
             if d.kind is Kind.USB and d.status is Status.DEGRADED),
         half=1.5,
     )
-    # Removable drives sitting empty. A floppy or card reader keeps its block
-    # device when the medium leaves — same node, same tags, same status, only
-    # the capacity goes to zero. Nothing else here reads capacity, so without
-    # this channel ejecting a disk is completely invisible to the fly: the two
-    # scans produce byte-identical tags.
-    raw["state:empty-bay"] = _saturate(
-        sum(1 for d in devices
-            if d.kind is Kind.STORAGE
-            and d.metrics.get("size_bytes", -1.0) == 0.0),
-        half=1.0,
+    # Removable drives, and what is in them. A floppy or card reader keeps its
+    # block device when the medium leaves — same node, same tags, same status,
+    # only the capacity goes to zero. Nothing else here reads capacity, so
+    # without this channel ejecting a disk is invisible: the two scans produce
+    # byte-identical tags.
+    #
+    # Graded rather than binary, because capacity has three states and not two.
+    # The storage backend asks the drive directly, and on real hardware a disk
+    # is readable ~190ms before its size stops reporting zero. That middle
+    # value is the insertion *happening*, as distinct from having happened, and
+    # it is the only reading that arrives while there is still time to lead it.
+    #
+    # Deliberately still one channel under the same name: the glomerulus list
+    # is what a trained memory is indexed against, and a receptor that reports
+    # more without being renamed costs nobody their training.
+    bays = [d.metrics["medium_state"] for d in devices if "medium_state" in d.metrics]
+    if bays:
+        raw["state:empty-bay"] = max(bays)
+    else:
+        raw["state:empty-bay"] = _saturate(
+            sum(1 for d in devices
+                if d.kind is Kind.STORAGE
+                and d.metrics.get("size_bytes", -1.0) == 0.0),
+            half=1.0,
+        )
+
+    # Is a disk actually working, as opposed to merely being there. Presence
+    # and activity are different facts and nothing here carried the second
+    # one: a drive reading and the same drive idle produced identical tags, so
+    # a state taught as "reading" was being taught on a smell it did not have.
+    raw["state:disk-read"] = max(
+        (d.metrics.get("io_busy", 0.0) for d in devices), default=0.0
     )
+
+    # Whether anything removable is mounted. Presence, activity and *being in
+    # use* are three different facts, and the fly had only the first two.
+    #
+    # One channel, not three. "Mounting" and "unmounting" are not separate
+    # smells to give receptors to — they are this channel crossed with
+    # `state:disk-read`, and reading a conjunction of receptors is precisely
+    # what the Kenyon cells are for. Mounted-and-busy is an unmount flushing;
+    # unmounted-and-busy is a mount reading the superblock. The fly can learn
+    # both without either being wired in.
+    # Which devices count as "the removable one" is the part that went wrong
+    # the first time. `FUSB` sits on the USB device and the mountpoint sits on
+    # the block device under it, and `hotplug` is not set at all on this
+    # hardware — so the first version asked the wrong object and the channel
+    # read zero forever. `medium_state` is the reliable marker: the storage
+    # backend puts it on exactly the removable drives it probed, and nothing
+    # else. Partitions of such a drive count too, since that is where a
+    # mountpoint lands when the disk has a partition table.
+    bays = {d.uid for d in devices if "medium_state" in d.metrics}
+    raw["state:mounted"] = 1.0 if any(
+        d.detail.get("mounted at")
+        for d in devices
+        if d.uid in bays or d.parent in bays
+    ) else 0.0
 
     raw["state:fs-pressure"] = max(
         (d.metrics.get("fs_used_pct", 0.0) / 100.0 for d in devices), default=0.0
@@ -368,7 +450,12 @@ def _project(raw: dict[str, float]) -> list[float]:
     total = sum(values)
     sigma = 0.12                       # spontaneous drive; keeps a silent scan finite
     scale = sigma + 1.5 * (total / len(values))
-    return [v / scale for v in values]
+    out = [v / scale for v in values]
+    # Pad to the wired slot count. Unused slots are silent receptors: a claw
+    # landing on one contributes nothing, which is what lets the list grow
+    # without rewiring anything.
+    out.extend([0.0] * (GLOM_SLOTS - len(out)))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -383,15 +470,28 @@ def _wire_claws() -> tuple[tuple[int, ...], ...]:
     encode smells evolution never met.
     """
     rng = random.Random(WIRING_SEED)
-    n = len(GLOMERULI)
     return tuple(
-        tuple(rng.sample(range(n), CLAWS_PER_KENYON_CELL))
+        tuple(rng.sample(range(GLOM_SLOTS), CLAWS_PER_KENYON_CELL))
         for _ in range(KENYON_CELLS)
     )
 
 
 #: Grown once at import. ~12,000 small ints; cheap to hold, expensive to redo.
 CLAWS: tuple[tuple[int, ...], ...] = _wire_claws()
+
+#: How many of each cell's claws land on a slot that currently holds a
+#: receptor, rather than on empty space reserved for future ones.
+#:
+#: Needed because the sum has to be divided by it. Without that, a cell whose
+#: claws all land on live slots systematically outscores one with two claws in
+#: empty space, the winner-take-all always picks from the former, and the
+#: effective population collapses — at 52 receptors in 64 slots only 29% of
+#: cells have six live claws, so 2,000 Kenyon cells were doing the work of
+#: about 600. Measured effect: two scans differing in a single receptor went
+#: from clearly distinct to 0.79 overlap.
+LIVE_CLAWS: tuple[int, ...] = tuple(
+    max(1, sum(1 for i in claws if i < len(GLOMERULI))) for claws in CLAWS
+)
 
 #: Kenyon cells that survive APL inhibition. 5% of 2,000 = a 100-bit tag.
 TAG_BITS = max(1, int(KENYON_CELLS * SPARSITY))
@@ -405,7 +505,8 @@ def _kenyon_tag(pn: list[float]) -> tuple[int, ...]:
     of the circuit, not a tuned threshold, which is why it holds across
     wildly different inputs.
     """
-    sums = [sum(pn[i] for i in claws) for claws in CLAWS]
+    sums = [sum(pn[i] for i in claws) / LIVE_CLAWS[k]
+            for k, claws in enumerate(CLAWS)]
     order = sorted(range(KENYON_CELLS), key=lambda k: sums[k], reverse=True)
     return tuple(sorted(order[:TAG_BITS]))
 
@@ -666,6 +767,12 @@ def brain_path() -> Path:
     return Path(base) / "updev" / "flybrain.json"
 
 
+def previous_path(brain: Path | None = None) -> Path:
+    """The memory as it was before the last write."""
+    brain = brain or brain_path()
+    return brain.with_name(brain.stem + "-previous.json")
+
+
 def reflex_path(brain: Path | None = None) -> Path:
     """Reflexes live beside the brain, not inside it.
 
@@ -727,6 +834,23 @@ class FlyBrain:
     #: changed is merely inconvenient.
     reset_reason: str = ""
     lost_states: list[str] = field(default_factory=list)
+
+    #: Receptors added since this memory was trained. It keeps everything it
+    #: learned; these are simply channels it has not met yet.
+    grew_by: list[str] = field(default_factory=list)
+
+    #: What the last write did, so a mistake can be described when it is
+    #: rolled back. Persisted, because the person who needs to undo it is
+    #: usually in a later shell than the one that made it.
+    last_action: dict[str, Any] = field(default_factory=dict)
+
+    #: Anything in the file that is not ours, carried through a load/save
+    #: round trip untouched. The memory lives in a shared state directory and
+    #: other tools write into the same file; dropping their keys on every save
+    #: because we did not recognise them would be destroying someone's data to
+    #: tidy up our own.
+    extra: dict[str, Any] = field(default_factory=dict)
+    extra_states: dict[str, Any] = field(default_factory=dict)
 
     # -- readout -----------------------------------------------------------
 
@@ -883,6 +1007,12 @@ class FlyBrain:
 
         self.exposures += 1
         self.updated = time.time()
+        self.last_action = {
+            "what": "learn",
+            "state": state,
+            "when": self.updated,
+            "exposures": self.exposures,
+        }
         return verdict
 
     def forget(self, state: str = "") -> bool:
@@ -935,8 +1065,11 @@ class FlyBrain:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            **self.extra,
+            "version": 3,
             "signature": self.signature,
+            "glomeruli": list(GLOMERULI),
+            "last_action": self.last_action,
             "wiring_seed": WIRING_SEED,
             "kenyon_cells": KENYON_CELLS,
             "exposures": self.exposures,
@@ -948,53 +1081,122 @@ class FlyBrain:
             },
             "aversive": {str(k): round(v, 5) for k, v in self.aversive.items()},
             "states": {
-                name: {str(k): round(v, 5) for k, v in table.items()}
-                for name, table in self.states.items()
+                **self.extra_states,
+                **{name: {str(k): round(v, 5) for k, v in table.items()}
+                   for name, table in self.states.items()},
             },
         }
 
     def save(self, path: Path | None = None) -> Path:
-        """Write atomically — a half-written brain is worse than none."""
+        """Write atomically, keeping the version it replaced.
+
+        One step of history, because teaching the wrong thing is easy and
+        silent — a mount that did not happen, a shell line with || where &&
+        was meant — and without this the only way back is to forget the state
+        entirely and start it over. One step is enough: the mistake is noticed
+        immediately or not at all.
+        """
         path = path or brain_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                previous_path(path).write_bytes(path.read_bytes())
+                _restore_ownership(previous_path(path))
+            except OSError:
+                pass            # history is a convenience, never a blocker
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.as_dict(), indent=2), encoding="utf-8")
         os.replace(tmp, path)
         _restore_ownership(path)
         return path
 
+    #: Top-level keys this class owns. Anything else in the file belongs to
+    #: somebody else and is carried through untouched.
+    _OWNED = frozenset({
+        "version", "signature", "wiring_seed", "kenyon_cells", "exposures",
+        "created", "updated", "compartments", "aversive", "states", "familiar",
+        "glomeruli", "last_action",
+    })
+
+    @staticmethod
+    def _weights(table: Any) -> dict[int, float] | None:
+        """A Kenyon-cell weight table, or None if that is not what this is.
+
+        Written to survive anything, because this file is not ours alone. It
+        lives in a state directory a person can open, and other tools write
+        alongside us in it — one of them stored a plain string under `states`
+        and the loader crashed on it, which is a bug in the loader and not in
+        the file. Nothing read from disk is assumed to have the shape it ought.
+        """
+        if not isinstance(table, dict):
+            return None
+        out: dict[int, float] = {}
+        for k, v in table.items():
+            try:
+                out[int(k)] = float(v)
+            except (TypeError, ValueError):
+                continue                    # one bad cell is not a bad table
+        return out
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FlyBrain":
+        raw_states = data.get("states")
+        raw_states = raw_states if isinstance(raw_states, dict) else {}
+
+        states: dict[str, dict[int, float]] = {}
+        extra_states: dict[str, Any] = {}
+        for name, table in raw_states.items():
+            weights = cls._weights(table)
+            if weights is None:
+                extra_states[str(name)] = table     # someone else's, kept as is
+            else:
+                states[str(name)] = weights
+
         brain = cls(
-            aversive={int(k): float(v) for k, v in (data.get("aversive") or {}).items()},
-            states={
-                str(name): {int(k): float(v) for k, v in (table or {}).items()}
-                for name, table in (data.get("states") or {}).items()
-            },
-            exposures=int(data.get("exposures") or 0),
-            created=float(data.get("created") or time.time()),
-            updated=float(data.get("updated") or 0.0),
+            aversive=cls._weights(data.get("aversive")) or {},
+            states=states,
+            exposures=_as_int(data.get("exposures")),
+            created=_as_float(data.get("created"), time.time()),
+            updated=_as_float(data.get("updated"), 0.0),
             signature=str(data.get("signature") or ""),
         )
+        last = data.get("last_action")
+        brain.last_action = last if isinstance(last, dict) else {}
+        brain.extra = {k: v for k, v in data.items() if k not in cls._OWNED}
+        brain.extra_states = extra_states
 
         stored = data.get("compartments")
         if isinstance(stored, dict):
             for key, table in stored.items():
                 comp = brain.compartments.get(key)
-                if comp is not None:
-                    comp.weights = {int(k): float(v) for k, v in (table or {}).items()}
+                weights = cls._weights(table)
+                if comp is not None and weights is not None:
+                    comp.weights = weights
             return brain
 
         # Version 1 kept one undifferentiated `familiar` table. Seed every
         # compartment from it rather than discarding the training: what it
         # recorded is true of all three timescales at the moment it was
         # written, and the half-lives sort out the rest from here on.
-        legacy = data.get("familiar")
-        if isinstance(legacy, dict):
-            weights = {int(k): float(v) for k, v in legacy.items()}
+        legacy = cls._weights(data.get("familiar"))
+        if legacy:
             for comp in brain.compartments.values():
-                comp.weights = dict(weights)
+                comp.weights = dict(legacy)
         return brain
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _dopamine(result: ScanResult) -> float:
@@ -1028,11 +1230,30 @@ def load_brain(path: Path | None = None) -> FlyBrain:
         return FlyBrain()
     if not isinstance(data, dict):
         return FlyBrain()
-    brain = FlyBrain.from_dict(data)
+    try:
+        brain = FlyBrain.from_dict(data)
+    except Exception:
+        # "Never raises" has to mean it. `from_dict` guards every shape it
+        # knows about, but this file is shared with other tools and the next
+        # surprise in it should still cost a naive fly rather than a traceback
+        # in the middle of someone's scan.
+        return FlyBrain()
+    stored_names = data.get("glomeruli")
+    stored_names = stored_names if isinstance(stored_names, list) else []
+    grew = bool(stored_names) and stored_names != list(GLOMERULI) \
+        and compatible_layer(stored_names)
+    if grew:
+        # Receptors were appended since this was trained. Every slot it knew
+        # still means what it meant, so the weights are kept and the new
+        # channels are simply things it has not smelled yet.
+        brain.signature = glomerulus_signature()
+        brain.grew_by = [n for n in GLOMERULI if n not in stored_names]
+        return brain
+
     if brain.signature != glomerulus_signature():
-        # The input layer changed under it. Keep the file for inspection, but
-        # hatch fresh — old weights index Kenyon cells that now mean something
-        # else entirely, including the ones behind every named state.
+        # The input layer changed in a way that moved things. Keep the file for
+        # inspection, but hatch fresh — old weights index Kenyon cells that now
+        # mean something else entirely, including every named state.
         fresh = FlyBrain()
         fresh.created = brain.created
         fresh.reset_reason = (

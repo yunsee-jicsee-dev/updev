@@ -1459,6 +1459,26 @@ def fly_learn(state: State, times, as_state, path):
     target = Path(path) if path else None
     brain = load_brain(target)
     result = state.scan()
+
+    # Teaching a name onto a smell that already belongs to a different name
+    # does not fail — it quietly makes both unreliable, and the damage only
+    # shows up later as "확실치 않음". It has happened three times here, each
+    # time because the thing being named had not actually happened: a mount
+    # that failed, a command joined with || instead of &&. The fly cannot know
+    # the intent, but it can see that this smells like something else already.
+    clash = _naming_clash(brain, result, as_state) if as_state else None
+    if clash and not state.as_json:
+        other, score = clash
+        state.console.print(Panel(
+            Text(f"지금 이 스캔은 이미 '{other}' 로 배운 냄새와 거의 같습니다 "
+                 f"(일치도 {score:.2f}).\n\n"
+                 f"'{as_state}' 로 가르치면 둘 다 구분이 안 되게 됩니다. "
+                 f"바꾸려던 상태가 실제로 바뀌었는지 확인하세요 — 마운트가 "
+                 f"정말 됐는지, 명령이 && 인지 || 인지.",
+                 style="yellow"),
+            title="같은 냄새", title_align="left",
+            border_style="yellow", box=box.ROUNDED))
+
     before = None
     for _ in range(max(1, times)):
         verdict = brain.learn(result, state=as_state or "")
@@ -1480,6 +1500,159 @@ def fly_learn(state: State, times, as_state, path):
     if as_state:
         tail += f" · 상태 이름 '{as_state}'"
     state.console.print(tail + f" · {saved}[/dim]")
+
+
+def confirm_target(brain, recognition, state_name: str, anyway: bool):
+    """(state to reinforce, refusal). Exactly one of the two is set.
+
+    Split out of the command so the refusals can be tested, because they are
+    the part that matters. Agreeing with a correct reading is easy; declining
+    to agree with an uncertain one is what keeps a confused pair of states
+    from being trained further into each other.
+    """
+    if state_name:
+        if state_name not in brain.states:
+            known = ", ".join(sorted(brain.states)) or "(없음)"
+            return "", (f"'{state_name}' 는 배우지 않은 상태입니다. 아는 상태: {known}\n"
+                        f"새로 가르치려면:  updev fly learn --as {state_name}")
+        return state_name, ""
+
+    if not recognition.label:
+        return "", ("승인할 판정이 없습니다 — 아직 이름 붙은 상태를 배우지 않았습니다.\n"
+                    "먼저 가르치세요:  updev fly learn --as <이름>")
+
+    if recognition.score < recognition.FLOOR:
+        return "", (f"지금 상태는 아는 것 중 어느 것도 아닙니다 "
+                    f"(최고 {recognition.score:.2f}).\n"
+                    f"새 상태라면:  updev fly learn --as <이름>")
+
+    if not recognition.confident and not anyway:
+        runners = ", ".join(f"{n} {s:.2f}" for n, s in recognition.runners[:2])
+        return "", (f"'{recognition.label}' 같지만 확실하지 않습니다 "
+                    f"(격차 {recognition.margin:.3f}; {runners}).\n"
+                    f"애매한 판정을 승인하면 그 애매함이 학습됩니다.\n"
+                    f"어느 쪽인지 아시면:  updev fly yes <이름>\n"
+                    f"그래도 승인하려면:  updev fly yes --anyway")
+
+    return recognition.label, ""
+
+
+@fly.command("undo")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_undo(state: State, path):
+    """방금 가르친 것을 취소한다 — "말실수 했음".
+
+    Every write keeps the version it replaced, so the last `learn` or `yes`
+    can be taken back. One step only: a mistaken lesson is noticed straight
+    away or not at all, and a deeper history would mostly be a way to restore
+    something older than the thing you meant.
+    """
+    import shutil
+
+    from .flybrain import brain_path, load_brain, previous_path
+
+    target = Path(path) if path else brain_path()
+    prev = previous_path(target)
+    if not prev.exists():
+        raise click.ClickException(
+            f"되돌릴 판본이 없습니다 — {prev.name} 이 아직 만들어지지 않았습니다.\n"
+            "저장이 한 번이라도 일어난 뒤에야 직전 상태가 생깁니다.")
+
+    undone = load_brain(target).last_action
+    shutil.copyfile(prev, target)
+    from .flybrain import _restore_ownership
+
+    _restore_ownership(target)
+    now = load_brain(target)
+
+    if state.as_json:
+        state.emit({"undone": undone, "brain": now.stats(), "path": str(target)})
+        return
+
+    what = undone.get("state") or "(이름 없는 학습)"
+    state.console.print(f"[yellow]되돌렸습니다 — 직전 학습 '{what}' 취소[/yellow]")
+    state.console.print(
+        f"[dim]누적 {now.exposures}회 · 상태 {sorted(now.states) or '없음'} · {target}[/dim]")
+
+
+@fly.command("yes")
+@click.argument("state_name", metavar="[STATE]", required=False)
+@click.option("-n", "--times", type=int, default=1, show_default=True,
+              help="Reinforce this many times.")
+@click.option("--anyway", is_flag=True,
+              help="Confirm even when the fly is not sure which state it is.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_yes(state: State, state_name, times, anyway, path):
+    """방금 판정이 맞다고 승인한다 — "그거 맞음".
+
+    `fly sniff` says which state it thinks the board is in. This agrees with
+    it and reinforces that state, without retyping the name.
+
+    It refuses when the fly is not sure, and that refusal is the point. An
+    uncertain reading means two states already overlap; agreeing with the
+    coin-flip trains the overlap in and makes both of them worse. Pass a name
+    to say which one it should have been, or `--anyway` to confirm the guess.
+    """
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+    result = state.scan()
+    verdict = brain.judge(result)
+    recognition = verdict.recognition
+
+    chosen, refusal = confirm_target(brain, recognition, state_name, anyway)
+    if refusal:
+        raise click.ClickException(refusal)
+
+    before = recognition.score
+    for _ in range(max(1, times)):
+        brain.learn(result, state=chosen)
+    saved = brain.save(target)
+    after = brain.judge(result).recognition
+
+    if state.as_json:
+        state.emit({
+            "confirmed": chosen,
+            "score_before": round(before, 4),
+            "score_after": round(after.score, 4),
+            "brain": brain.stats(), "path": str(saved),
+        })
+        return
+
+    corrected = bool(state_name) and state_name != recognition.label
+    head = f"[bold green]'{chosen}' 확인[/bold green]" if not corrected else \
+           f"[bold yellow]'{recognition.label}' 이 아니라 '{chosen}' 으로 정정[/bold yellow]"
+    state.console.print(head)
+    state.console.print(
+        f"[dim]일치도 {before:.3f} → {after.score:.3f}, 누적 {brain.exposures}회 · {saved}[/dim]")
+
+
+#: A different state scoring at least this on the scan being taught means the
+#: two are, as far as the receptors go, the same thing.
+NAMING_CLASH = 0.80
+
+
+def _naming_clash(brain, result, name: str):
+    """(other state, score) when this scan already belongs to a different name.
+
+    Checked before learning rather than after, because after one exposure the
+    new name scores high on its own account and the collision is hidden.
+    """
+    from .flybrain import smell
+
+    if not brain.states:
+        return None
+    recognition = brain.recognize(smell(result))
+    scores = [(recognition.label, recognition.score)] + recognition.runners
+    for other, score in scores:
+        if other and other != name and score >= NAMING_CLASH:
+            return other, score
+    return None
 
 
 @fly.command("states")
@@ -1779,12 +1952,29 @@ def _fdd_panel(drive, medium, surface, problems) -> Panel:
     body = [head]
 
     if medium and medium.files:
+        from .fdd import is_textual, read_file
+
         listing = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
-        listing.add_column("파일", style="bold")
-        listing.add_column("클러스터", justify="right", style="dim")
-        listing.add_column("바이트", justify="right")
+        listing.add_column("파일", style="bold", no_wrap=True)
+        listing.add_column("바이트", justify="right", no_wrap=True)
+        listing.add_column("내용", overflow="fold", ratio=1)
         for entry in medium.files:
-            listing.add_row(entry["name"], str(entry["cluster"]), f"{entry['size']:,}")
+            # One read per file, following its own FAT chain. A listing that
+            # only gives names makes you reach for `mount` to answer "what is
+            # actually on this", which on a failing floppy is the one thing
+            # worth not doing.
+            blob = read_file(medium.node, entry, medium.system)
+            if not blob:
+                preview = Text("읽을 수 없음", style="red")
+            elif is_textual(blob):
+                text = blob.decode("ascii", "replace")
+                lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+                shown = " ⏎ ".join(lines[:3])[:160]
+                more = "…" if len(lines) > 3 or len(blob) < entry["size"] else ""
+                preview = Text(shown + more, style="dim")
+            else:
+                preview = Text(f"바이너리 · {blob[:8].hex(' ').upper()}…", style="dim cyan")
+            listing.add_row(entry["name"], f"{entry['size']:,}", preview)
         body += [Text("\n루트 디렉터리", style="bold"), listing]
     elif medium and medium.fat12:
         body.append(Text("\n포맷은 되어 있지만 파일이 없습니다 — 빈 디스켓입니다.",

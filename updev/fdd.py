@@ -279,6 +279,9 @@ class Medium:
     files: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
     info: dict[str, Any] = field(default_factory=dict)
+    #: The first 33 sectors, kept so a file's FAT chain can be walked without
+    #: reading the disk a second time.
+    system: bytes = b""
 
     @property
     def summary(self) -> str:
@@ -347,12 +350,126 @@ def read_medium(node: str) -> Medium:
         return medium
 
     medium.info = info
+    medium.system = system
     medium.fat12 = bool(info.get("bootable_signature_present")) and \
         info.get("bytes_per_sector") == SECTOR
     medium.oem = str(info.get("oem") or "").strip()
     medium.label = str(info.get("volume_label") or "").strip()
     medium.files = [e for e in info.get("entries", []) if not e.get("volume_label")]
     return medium
+
+
+#: What a drive's medium is doing, as a number the fly can smell.
+#: 0.0 present and registered · 0.5 in, not yet registered · 1.0 not there.
+MEDIUM_PRESENT = 0.0
+MEDIUM_SETTLING = 0.5
+MEDIUM_ABSENT = 1.0
+
+
+def probe_medium(node: str, reported_size: int) -> float:
+    """Is there a disk in there — asked of the drive, not of the kernel.
+
+    Capacity is a lagging indicator. Measured on a TEAC drive at 20Hz, with a
+    disk going in: sector 0 became readable at t=4.41s and `/sys/block/sdb/size`
+    only caught up at t=4.60. For 190 milliseconds the medium was in, readable,
+    and reported as absent.
+
+    That gap is a state of its own, and it is the one nobody can see. A watcher
+    polling capacity has two states and learns two; one that also asks the
+    drive has three, and the third is the only one that says "this is happening
+    right now" rather than "this has happened".
+
+    Read-only: one 512-byte read at offset 0. An empty drive answers ENOMEDIUM
+    immediately rather than spinning, so this costs nothing when there is
+    nothing there — which is the case it runs in most often.
+    """
+    try:
+        fd = os.open(node, os.O_RDONLY)
+    except OSError:
+        return MEDIUM_ABSENT if reported_size <= 0 else MEDIUM_PRESENT
+    try:
+        readable = len(os.pread(fd, SECTOR, 0)) == SECTOR
+    except OSError:
+        readable = False
+    finally:
+        os.close(fd)
+
+    if not readable:
+        return MEDIUM_ABSENT
+    return MEDIUM_PRESENT if reported_size > 0 else MEDIUM_SETTLING
+
+
+#: Beyond this a file is summarised rather than shown. A floppy holds 1.44MB
+#: and a terminal does not.
+PREVIEW_BYTES = 2048
+
+
+def _fat12_next(fat: bytes, cluster: int) -> int:
+    """The next cluster in a chain. FAT12 packs three nibbles per entry, so
+    every other one straddles a byte boundary."""
+    offset = cluster + cluster // 2
+    if offset + 1 >= len(fat):
+        return 0xFFF
+    pair = fat[offset] | (fat[offset + 1] << 8)
+    return pair & 0x0FFF if cluster % 2 == 0 else pair >> 4
+
+
+def read_file(node: str, entry: dict, system: bytes,
+              limit: int = PREVIEW_BYTES) -> bytes:
+    """Pull one file off the disk by following its FAT chain.
+
+    `floppy.read_file` does the same thing but wants the whole 1.44MB image in
+    hand. Reading all of it to show a 200-byte text file would take the better
+    part of a minute on real hardware and drag the head across every bad
+    sector on the way — the same reason `read_medium` stops at the system
+    area. The FAT is already in `system`, so the chain can be walked and only
+    the clusters that belong to this file ever get read.
+
+    Stops at `limit`, and stops quietly on an unreadable cluster: a damaged
+    disk should still show what is left of a file rather than nothing.
+    """
+    fat_start = 1 * SECTOR                      # straight after the boot sector
+    fat = system[fat_start:fat_start + 9 * SECTOR]
+
+    cluster = int(entry.get("cluster") or 0)
+    remaining = min(int(entry.get("size") or 0), limit)
+    out = bytearray()
+
+    try:
+        fd = os.open(node, os.O_RDONLY)
+    except OSError:
+        return b""
+    try:
+        guard = 0
+        while 2 <= cluster < 0xFF0 and remaining > 0 and guard < 2880:
+            guard += 1
+            sector = SYSTEM_SECTORS + (cluster - 2)
+            try:
+                block = os.pread(fd, SECTOR, sector * SECTOR)
+            except OSError:
+                break                           # bad cluster; keep what we have
+            if len(block) < SECTOR:
+                break
+            take = min(remaining, SECTOR)
+            out += block[:take]
+            remaining -= take
+            cluster = _fat12_next(fat, cluster)
+    finally:
+        os.close(fd)
+    return bytes(out)
+
+
+def is_textual(blob: bytes) -> bool:
+    """Worth printing, as opposed to worth describing.
+
+    A NUL says binary outright; beyond that, mostly-printable is the test. A
+    kernel image and a config file both live on this disk and only one of them
+    belongs on a terminal.
+    """
+    if not blob or b"\0" in blob[:512]:
+        return False
+    printable = sum(1 for b in blob[:512] if 0x20 <= b < 0x7F or b in (9, 10, 13))
+    return printable / len(blob[:512]) > 0.85
 
 
 def _size_via_seek(node: str) -> int:

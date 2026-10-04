@@ -24,6 +24,10 @@ from ..core.util import (
     usb_address_from_path,
 )
 
+#: Capacities only a floppy has — the probe below is limited to these so it
+#: never touches a drive that might take its time answering.
+_FLOPPY_SIZES = frozenset({368_640, 737_280, 1_228_800, 1_474_560, 2_949_120})
+
 _LSBLK_COLUMNS = (
     "NAME,PATH,TYPE,SIZE,MODEL,SERIAL,VENDOR,REV,TRAN,ROTA,HOTPLUG,STATE,"
     "MOUNTPOINT,FSTYPE,FSSIZE,FSUSED,FSAVAIL,RO,PHY-SEC"
@@ -38,6 +42,49 @@ _SD_MANUFACTURERS = {
     0x41: "Kingston", 0x51: "STEC", 0x5D: "Swissbit", 0x6F: "STMicro",
     0x74: "Transcend", 0x76: "Patriot", 0x82: "Sony/Gobe", 0x9C: "Angelbird/Hoodman",
 }
+
+
+def _io_busy(name: str) -> float | None:
+    """Fraction of wall time this device spends doing I/O, sampled twice.
+
+    Field 9 of /sys/block/X/stat is io_ticks: milliseconds the queue has been
+    non-empty. Differenced against elapsed time it is what iostat prints as
+    %util, and it answers the question a snapshot cannot — is this drive
+    working, as opposed to merely present.
+
+    Two samples in one call, rather than remembering the last scan's. A cache
+    across scans looks cheaper and does not work: every `updev` run is a fresh
+    process, so the cache is always empty and the rate is always unknown. That
+    was the first version, and it returned None every single time. Persisting
+    it to disk would fix that and make a read-only scan start writing files,
+    which is a worse trade than 80 milliseconds.
+
+    `inflight` would avoid the wait but not the problem — it is instantaneous,
+    the queue empties between requests, and sampling it during a real read
+    caught nothing at all.
+
+    None when the counter cannot be read.
+    """
+    import time
+
+    def ticks() -> int | None:
+        parts = read_text(f"/sys/block/{name}/stat").split()
+        if len(parts) < 10:
+            return None
+        try:
+            return int(parts[9])
+        except ValueError:
+            return None
+
+    first = ticks()
+    if first is None:
+        return None
+    time.sleep(0.08)
+    second = ticks()
+    if second is None:
+        return None
+    busy = (second - first) / 80.0
+    return 0.0 if busy < 0 else (1.0 if busy > 1.0 else busy)
 
 
 def _usb_parent(name: str) -> str:
@@ -258,6 +305,51 @@ class StorageBackend(Backend):
 
         if node.get("tran") == "usb":
             dev.tags.append("usb-storage")
+
+        self._medium_state(dev, name, node)
+
+    @staticmethod
+    def _medium_state(dev: Device, name: str, node: dict) -> None:
+        """Ask a removable drive whether it actually has a disk in it.
+
+        `lsblk` reports capacity, and capacity lags: on the drive this was
+        written against, a floppy going in was readable 190ms before its size
+        stopped saying zero. In that window the kernel calls the medium absent
+        and it is sitting right there.
+
+        Narrowly scoped on purpose. Only removable drives that are empty or
+        floppy-sized get probed, so this is a single 512-byte read on hardware
+        that answers ENOMEDIUM instantly when there is nothing in it — never
+        the hard disk, never anything that could take a second to reply.
+        """
+        if read_text(f"/sys/block/{name}/removable") != "1":
+            return
+        size = int(node.get("size") or 0)
+        if size and size not in _FLOPPY_SIZES:
+            return
+
+        from ..fdd import MEDIUM_PRESENT, MEDIUM_SETTLING, probe_medium
+
+        # Costs 80ms, so it is kept inside the same narrow gate as the medium
+        # probe: removable drives that are empty or floppy-sized, and nothing
+        # else. The system disk is never made to wait for this.
+        busy = _io_busy(name)
+        if busy is not None:
+            dev.metrics["io_busy"] = busy
+            if busy > 0.05:
+                dev.detail["io"] = f"{busy:.0%} 사용 중 — 읽는 중"
+                dev.tags.append("reading")
+
+        state = probe_medium(dev.node, size)
+        dev.metrics["medium_state"] = state
+        if state == MEDIUM_SETTLING:
+            dev.detail["medium"] = "삽입 중 — 읽히지만 용량은 아직 0"
+            dev.tags.append("medium-settling")
+        elif state == MEDIUM_PRESENT:
+            dev.detail["medium"] = "있음"
+        else:
+            dev.detail["medium"] = "없음"
+            dev.tags.append("no-medium")
 
     @staticmethod
     def _pcie_link(base: Path) -> dict:
