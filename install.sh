@@ -6,10 +6,11 @@
 # *use* updev from a checkout (bin/updev works as-is); this is for getting the
 # optional backends and the `updev` command onto the system.
 #
-#   ./install.sh              core + hardware backends + the wheel
-#   ./install.sh --core       just the two required python packages
-#   ./install.sh --tools      just the external CLI tools
-#   ./install.sh --dry-run    print what it would do
+#   ./install.sh                  core + hardware backends + the wheel
+#   ./install.sh --core           just the two required python packages
+#   ./install.sh --tools          just the external CLI tools
+#   ./install.sh --panel-service  register the ST7735S boot screen with systemd
+#   ./install.sh --dry-run        print what it would do
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -19,6 +20,7 @@ DO_CORE=1
 DO_HARDWARE=1
 DO_TOOLS=1
 DO_WHEEL=1
+DO_PANEL=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -26,7 +28,8 @@ for arg in "$@"; do
         --core)     DO_HARDWARE=0; DO_TOOLS=0; DO_WHEEL=0 ;;
         --tools)    DO_CORE=0; DO_HARDWARE=0; DO_WHEEL=0 ;;
         --no-wheel) DO_WHEEL=0 ;;
-        -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
+        --panel-service) DO_CORE=0; DO_HARDWARE=0; DO_TOOLS=0; DO_WHEEL=0; DO_PANEL=1 ;;
+        -h|--help)  sed -n '2,15p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -110,6 +113,39 @@ if [ "$DO_WHEEL" = 1 ]; then
         note "~/.local/bin 이 PATH 에 있어야 'updev' 가 잡힌다:"
         note '  echo '"'"'export PATH="$HOME/.local/bin:$PATH"'"'"' >> ~/.bashrc'
     fi
+fi
+
+if [ "$DO_PANEL" = 1 ]; then
+    say "ST7735S 패널 서비스 등록"
+    # Where updev lives depends on how it was installed. An installed entry
+    # point wins; otherwise run straight out of this checkout.
+    if command -v updev >/dev/null 2>&1; then
+        PANEL_EXEC=$(command -v updev)
+    else
+        PANEL_EXEC="$PWD/bin/updev"
+        note "설치된 updev 가 없어 체크아웃에서 실행: $PANEL_EXEC"
+    fi
+
+    for grp in spi gpio; do
+        id -nG "$USER" | tr ' ' '\n' | grep -qx "$grp" || {
+            note "경고: $USER 가 $grp 그룹에 없다 — 서비스가 패널을 못 연다"
+            note "  sudo usermod -aG $grp $USER   (재로그인 필요)"
+        }
+    done
+
+    UNIT=/etc/systemd/system/updev-panel.service
+    if [ "$DRY_RUN" = 1 ]; then
+        note "would write $UNIT with ExecStart=$PANEL_EXEC panel boot"
+    else
+        sed -e "s|@EXEC@|$PANEL_EXEC|g" \
+            -e "s|@USER@|$USER|g" \
+            -e "s|@WORKDIR@|$PWD|g" \
+            systemd/updev-panel.service.in | sudo tee "$UNIT" >/dev/null
+    fi
+    run sudo systemctl daemon-reload
+    run sudo systemctl enable --now updev-panel.service
+    note "확인:  systemctl status updev-panel.service"
+    exit 0
 fi
 
 say "그룹 확인"

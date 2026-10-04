@@ -1,0 +1,25 @@
+# camtoy. Capture goes through an ffmpeg pipe rather than a capture library,
+# so install ffmpeg first — without it camtoy cannot open a camera at all:
+#   sudo apt install ffmpeg v4l-utils
+#
+# On Raspberry Pi OS prefer apt for the Python side too; the system Python is
+# externally managed:
+#   sudo apt install python3-numpy python3-pil python3-pygame python3-sounddevice
+numpy>=1.24          # every effect, palette and buffer
+Pillow>=10.0         # resampling and PNG output
+
+# Optional. Each one disables exactly one feature if missing.
+pygame>=2.5          # --display window
+sounddevice>=0.4     # camtoy theremin
+
+# The ten neural modes (detect, classify, face, pose, hand, segment, depth,
+# style, text, track). Raspberry Pi OS has no apt package for onnxruntime, and
+# the system Python is externally managed, so it goes in a venv that can still
+# see the apt-installed numpy and Pillow:
+#
+#   python3 -m venv --system-site-packages .venv-nn
+#   .venv-nn/bin/pip install onnxruntime
+#   .venv-nn/bin/camtoy models pull --all
+#
+# Weights are a separate 850MB download, not a Python dependency.
+onnxruntime>=1.17

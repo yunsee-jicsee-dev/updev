@@ -4,10 +4,15 @@
 so it pipes and scrolls like any other command-line tool.
 
 `UsbZone` — `updev usb zone`, the 체험존. Plug something in and it tells you
-which class it is *and why*, laying out every signature it read and what each
-one argued for. Reclassifies as facts arrive: a disk shows up on USB before
-the kernel has finished SCSI enumeration, so the first verdict is often made
-on partial evidence and improves a beat later.
+what it is *and why*, laying out every signature it read and what each one
+argued for — then hands you the tool that fits it. Storage goes through the
+signature classifier; everything else through role detection; both end at
+`toolkit`, which is what makes a floppy offer `updev floppy` and a keyboard
+offer `updev hid watch` instead of a shrug.
+
+Reclassifies as facts arrive: a disk shows up on USB before the kernel has
+finished SCSI enumeration, so the first verdict is often made on partial
+evidence and improves a beat later.
 """
 
 from __future__ import annotations
@@ -28,6 +33,8 @@ from rich.text import Text
 from ..core.changes import Change, ChangeKind, diff_devices
 from ..core.model import Device, Kind, ScanResult
 from ..core.registry import ProbeContext, Scanner
+from ..toolkit import Recognition, Tool, annotate, recognize
+from ..usbrole import ROLE_STYLE, UsbRole
 from ..usbclass import (
     CLASS_LABEL,
     CLASS_STYLE,
@@ -122,7 +129,14 @@ class EventMonitor:
 # ==========================================================================
 
 class UsbZone:
-    """The 체험존: plug a device in, get a classification with its reasoning."""
+    """The 체험존: plug a device in, get an identification *and* the tool for it.
+
+    Storage keeps the signature classifier and its evidence table. Everything
+    else — cameras, keyboards, Wi-Fi dongles, phones, hubs — gets role
+    detection, which used to be reachable only through `updev usb path`. Both
+    paths end in the same place: `toolkit.recognize()`, and a panel listing
+    what can actually be run against the thing now sitting in the port.
+    """
 
     def __init__(
         self,
@@ -130,14 +144,16 @@ class UsbZone:
         ctx: ProbeContext,
         console: Console,
         interval: float = 0.25,
+        storage_only: bool = False,
     ) -> None:
         self.scanner = scanner
         self.ctx = ctx
         self.console = console
         self.interval = max(0.1, interval)
+        self.storage_only = storage_only
         self.previous: dict[str, Device] = {}
-        self.current: tuple[Device, Verdict] | None = None
-        self.history: deque[tuple[float, Device, Verdict]] = deque(maxlen=12)
+        self.current: tuple[Device, Recognition] | None = None
+        self.history: deque[tuple[float, Device, Recognition]] = deque(maxlen=12)
         self.polls = 0
         #: Devices present at startup are the baseline, not "plugged in".
         self.baseline: set[str] = set()
@@ -149,7 +165,7 @@ class UsbZone:
         self.previous = first.by_uid()
         self.baseline = set(self.previous)
         if include_existing:
-            for dev in self._storage_devices(first):
+            for dev in self._candidates(first):
                 self._present(dev)
 
         with Live(self.render(), console=self.console, screen=True,
@@ -170,48 +186,57 @@ class UsbZone:
         now = result.by_uid()
 
         for change in diff_devices(self.previous, now):
-            if change.kind == ChangeKind.ADDED and self._is_usb_storage(change.device):
+            if change.kind == ChangeKind.ADDED and self._is_candidate(change.device):
                 self._present(change.device)
             elif change.kind == ChangeKind.REMOVED and self.current:
                 if change.device.uid == self.current[0].uid:
                     self.current = None
 
         # A freshly plugged disk enumerates in stages, so keep re-reading until
-        # the block device turns up and the verdict stops improving.
+        # the block device turns up and the verdict stops improving. The same
+        # is true of roles: the kernel binds drivers after enumeration, and a
+        # driver binding outranks every descriptor we can read before it.
         if self.current:
             dev = now.get(self.current[0].uid)
             if dev is not None:
-                verdict = self._classify(dev)
-                if verdict.usb_class != UsbClass.UNKNOWN or self.current[1].usb_class == UsbClass.UNKNOWN:
-                    self.current = (dev, verdict)
+                fresh = self._recognize(dev)
+                if _improves(fresh, self.current[1]):
+                    self.current = (dev, fresh)
                     if self.history and self.history[-1][1].uid == dev.uid:
-                        self.history[-1] = (self.history[-1][0], dev, verdict)
+                        self.history[-1] = (self.history[-1][0], dev, fresh)
 
         self.previous = now
 
     def _present(self, dev: Device) -> None:
-        verdict = self._classify(dev)
-        self.current = (dev, verdict)
-        self.history.append((time.time(), dev, verdict))
+        recognition = self._recognize(dev)
+        self.current = (dev, recognition)
+        self.history.append((time.time(), dev, recognition))
+
+    def _is_candidate(self, dev: Device) -> bool:
+        if dev.kind != Kind.USB or "root-hub" in dev.tags:
+            return False
+        return "storage" in dev.tags if self.storage_only else True
+
+    def _candidates(self, result: ScanResult) -> list[Device]:
+        return [d for d in result.devices if self._is_candidate(d)]
 
     @staticmethod
-    def _is_usb_storage(dev: Device) -> bool:
-        return dev.kind == Kind.USB and "storage" in dev.tags
-
-    @staticmethod
-    def _storage_devices(result: ScanResult) -> list[Device]:
-        return [d for d in result.devices if d.kind == Kind.USB and "storage" in d.tags]
-
-    @staticmethod
-    def _classify(dev: Device) -> Verdict:
-        return classify(gather_facts(usb_address=dev.address))
+    def _recognize(dev: Device) -> Recognition:
+        recognition = recognize(dev)
+        annotate(recognition.tools)
+        return recognition
 
     # -- rendering ---------------------------------------------------------
 
     def render(self) -> RenderableType:
         blocks: list[RenderableType] = [self._legend()]
         if self.current:
-            blocks.append(verdict_panel(*self.current))
+            dev, recognition = self.current
+            if recognition.storage is not None:
+                blocks.append(verdict_panel(dev, recognition.storage, show_facts=False))
+            else:
+                blocks.append(role_panel(dev, recognition))
+            blocks.append(tools_panel(recognition))
         else:
             blocks.append(self._waiting())
         if len(self.history) > 1:
@@ -231,14 +256,19 @@ class UsbZone:
         grid.add_row(*cells)
         title = Text("USB 체험존", style="bold bright_magenta")
         title.append(f"   poll #{self.polls}", style="dim")
-        return Panel(grid, title=title, title_align="left",
+        subtitle = Text("저장장치는 분류 · 그 외는 역할 판정 — 어느 쪽이든 맞는 툴까지",
+                        style="dim")
+        return Panel(Group(grid, subtitle), title=title, title_align="left",
                      border_style="bright_magenta", box=box.ROUNDED)
 
     def _waiting(self) -> Panel:
         body = Text()
-        body.append("\n  USB 저장장치를 꽂으세요", style="bold")
-        body.append("\n\n  꽂는 즉시 시그니처를 읽어서 어느 분류인지, ", style="dim")
+        what = "USB 저장장치를" if self.storage_only else "아무 USB 장치나"
+        body.append(f"\n  {what} 꽂으세요", style="bold")
+        body.append("\n\n  꽂는 즉시 시그니처를 읽어서 뭔지, ", style="dim")
         body.append("왜 그렇게 판단했는지", style="dim bold")
+        body.append(", 그리고 ", style="dim")
+        body.append("그걸로 뭘 할 수 있는지", style="dim bold")
         body.append(" 보여줍니다.\n", style="dim")
         body.append("\n  ctrl-c 로 종료\n", style="dim italic")
         return Panel(Align.center(body), border_style="dim", box=box.ROUNDED,
@@ -249,16 +279,41 @@ class UsbZone:
         grid.add_column(style="dim", no_wrap=True)
         grid.add_column(no_wrap=True)
         grid.add_column(overflow="ellipsis")
-        for when, dev, verdict in list(self.history)[:-1][::-1]:
-            badge = Text(f" {verdict.usb_class} ",
-                         style=f"bold black on {CLASS_STYLE[verdict.usb_class]}")
+        grid.add_column(style="cyan", no_wrap=True, overflow="ellipsis")
+        for when, dev, recognition in list(self.history)[:-1][::-1]:
+            badge = Text(f" {recognition.badge} ", style=_badge_style(recognition))
+            lead = recognition.lead
             grid.add_row(
                 datetime.fromtimestamp(when).strftime("%H:%M:%S"),
                 badge,
                 Text(dev.label, style="bold"),
+                Text(lead.command if lead else "", style="cyan"),
             )
         return Panel(grid, title="이번 세션에서 본 것", title_align="left",
                      border_style="dim", box=box.ROUNDED)
+
+
+def _improves(fresh: Recognition, held: Recognition) -> bool:
+    """Only replace a verdict with one that knows at least as much.
+
+    Enumeration races mean a second look can come back *worse* — the block
+    device disappears for a poll, or a driver is mid-bind — and flapping the
+    panel between "SUSB" and "unknown" is worse than being a beat behind.
+    """
+    if fresh.storage is not None and held.storage is not None:
+        if held.storage.usb_class != UsbClass.UNKNOWN:
+            return fresh.storage.usb_class != UsbClass.UNKNOWN
+        return True
+    fresh_roles = len(fresh.roles.roles) if fresh.roles else 0
+    held_roles = len(held.roles.roles) if held.roles else 0
+    return fresh_roles >= held_roles
+
+
+def _badge_style(recognition: Recognition) -> str:
+    if recognition.storage and recognition.storage.usb_class != UsbClass.UNKNOWN:
+        return f"bold black on {CLASS_STYLE[recognition.storage.usb_class]}"
+    primary = recognition.roles.primary if recognition.roles else UsbRole.UNKNOWN
+    return f"bold black on {ROLE_STYLE.get(primary, 'white')}"
 
 
 # ==========================================================================
@@ -369,4 +424,109 @@ def scores_bar(verdict: Verdict, width: int = 24) -> Table:
         if score < 0:
             bar = Text("▏negative", style="red dim")
         table.add_row(Text(str(cls), style=CLASS_STYLE.get(cls, "white")), bar, str(score))
+    return table
+
+
+def role_panel(dev: Device, recognition: Recognition) -> Panel:
+    """The identity card for anything that isn't storage.
+
+    Same shape as `verdict_panel` on purpose — a camera and a floppy drive
+    should read the same way, because to the person holding it they are the
+    same question.
+    """
+    roles = recognition.roles
+    primary = roles.primary if roles else UsbRole.UNKNOWN
+    style = ROLE_STYLE.get(primary, "white")
+    body: list[RenderableType] = []
+
+    headline = Text()
+    headline.append(f"  {recognition.badge}  ", style=f"bold black on {style}")
+    headline.append(f"   {recognition.headline}", style=f"bold {style}")
+    body.append(headline)
+
+    identity = Text("\n  ")
+    identity.append(dev.label, style="bold")
+    bits = [f"usb {dev.address}"]
+    if dev.summary:
+        bits.append(dev.summary)
+    identity.append("   " + " · ".join(bits), style="dim")
+    body.append(identity)
+
+    if roles and roles.evidence:
+        body.append(Text("\n  근거 (evidence → role)", style="bold dim"))
+        table = Table.grid(padding=(0, 2))
+        table.add_column(width=4, no_wrap=True)
+        table.add_column(width=22, no_wrap=True, overflow="ellipsis", style="dim")
+        table.add_column(overflow="fold")
+        for item in roles.evidence:
+            mark = Text(" !!", style="bold green") if item.definitive else Text("")
+            observed = Text(item.observed, style="bold")
+            observed.append(f"  → {item.role}", style=ROLE_STYLE.get(item.role, "white"))
+            table.add_row(mark, Text(f"[{item.source}]"), observed)
+            table.add_row("", "", Text(item.reason, style="dim italic"))
+        body.append(table)
+    else:
+        body.append(Text("\n  nothing bound and nothing declared — it may still "
+                         "be enumerating", style="dim italic"))
+
+    if recognition.nodes:
+        body.append(Text("\n  /dev 노드", style="bold dim"))
+        nodes = Table.grid(padding=(0, 2))
+        nodes.add_column(style="dim", justify="right", no_wrap=True, min_width=14)
+        nodes.add_column(overflow="fold")
+        for subsystem, names in sorted(recognition.nodes.items()):
+            nodes.add_row(subsystem, Text(", ".join(names)))
+        body.append(nodes)
+
+    return Panel(Group(*body), border_style=style, box=box.ROUNDED,
+                 title="판정", title_align="left")
+
+
+def tools_panel(recognition: Recognition, title: str = "여기서 할 수 있는 것") -> Panel:
+    """The other half of the merge: the commands that fit what was just found.
+
+    The lead tool is starred because for most devices there is one obvious
+    thing to do and burying it in a list of five helps nobody. Commands whose
+    binary is missing stay listed — knowing the tool exists is worth more than
+    a shorter list — but they say what to install.
+    """
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(width=2, no_wrap=True)
+    grid.add_column(overflow="fold")
+
+    if not recognition.tools:
+        return Panel(Text("  이 장치에 딱 맞는 툴이 아직 없습니다.", style="dim italic"),
+                     title=title, title_align="left", border_style="dim",
+                     box=box.ROUNDED)
+
+    for tool in recognition.tools:
+        mark = Text("★", style="bold yellow") if tool.lead else Text(" ")
+        head = Text(tool.title, style="bold" if tool.lead else "")
+        if tool.destructive:
+            head.append("  덮어씀", style="bold red")
+        if tool.missing:
+            head.append(f"  needs {tool.needs}", style="yellow dim")
+        block = Table.grid(padding=(0, 0))
+        block.add_column(overflow="fold")
+        block.add_row(head)
+        block.add_row(Text(tool.command, style="bold cyan" if not tool.missing else "cyan dim"))
+        block.add_row(Padding(Text(tool.why, style="dim italic"), (0, 0, 1, 0)))
+        grid.add_row(mark, block)
+
+    return Panel(grid, title=title, title_align="left",
+                 border_style="bright_yellow", box=box.ROUNDED)
+
+
+def tool_lines(tools: list[Tool]) -> Table:
+    """Compact form for `updev show` and `updev tools --brief`: one row each."""
+    table = Table.grid(padding=(0, 2))
+    table.add_column(width=2, no_wrap=True)
+    table.add_column(style="bold", no_wrap=True)
+    table.add_column(style="cyan", overflow="fold")
+    for tool in tools:
+        table.add_row(
+            Text("★", style="bold yellow") if tool.lead else Text(" "),
+            tool.title,
+            tool.command + (f"   (needs {tool.needs})" if tool.missing else ""),
+        )
     return table

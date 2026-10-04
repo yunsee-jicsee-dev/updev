@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .model import BackendReport, Device, Kind, ScanResult, status_weight
@@ -77,22 +78,34 @@ class Scanner:
             picked.append(b)
         return picked
 
-    def scan(self, ctx: ProbeContext | None = None) -> ScanResult:
+    def scan(self, ctx: ProbeContext | None = None,
+             on_report: Callable[[BackendReport], None] | None = None) -> ScanResult:
+        """Run the selected backends and collect what they found.
+
+        `on_report` fires once per backend as its result lands, on *this*
+        thread — the pool hands results back here, so a callback that draws to
+        a screen doesn't need a lock. It exists for front ends that show a scan
+        happening (the ST7735S boot panel) rather than only its outcome.
+        """
         ctx = ctx or ProbeContext()
         result = ScanResult(started=time.time())
         chosen = self.selected(ctx)
+
+        def note(report: BackendReport) -> None:
+            result.reports.append(report)
+            if on_report is not None:
+                on_report(report)
 
         runnable: list[Backend] = []
         for b in chosen:
             try:
                 ok, why = b.available(ctx)
             except Exception as e:                        # a broken availability check
-                result.reports.append(
-                    BackendReport(b.name, False, reason=f"availability check failed: {e}")
-                )
+                note(BackendReport(b.name, False,
+                                   reason=f"availability check failed: {e}"))
                 continue
             if not ok:
-                result.reports.append(BackendReport(b.name, False, reason=why))
+                note(BackendReport(b.name, False, reason=why))
                 continue
             runnable.append(b)
 
@@ -108,19 +121,17 @@ class Scanner:
             try:
                 for fut in as_completed(futures, timeout=deadline):
                     report, devices = fut.result()
-                    result.reports.append(report)
+                    note(report)
                     result.devices.extend(devices)
             except TimeoutError:
                 done = {r.name for r in result.reports}
                 for b in runnable:
                     if b.name not in done:
-                        result.reports.append(
-                            BackendReport(
-                                b.name, True, ok=False,
-                                error=f"exceeded {deadline:.0f}s scan deadline",
-                                duration=deadline,
-                            )
-                        )
+                        note(BackendReport(
+                            b.name, True, ok=False,
+                            error=f"exceeded {deadline:.0f}s scan deadline",
+                            duration=deadline,
+                        ))
 
         result.devices.sort(key=lambda d: (str(d.kind), status_weight(d.status), d.uid))
         result.reports.sort(key=lambda r: r.name)

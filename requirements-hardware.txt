@@ -9,7 +9,12 @@
 # build. Install it with apt only:  sudo apt install python3-picamera2
 psutil>=5.9          # net      interface addresses, per-NIC counters
 smbus2>=0.4          # i2c      address scanning, register read/write
+                     # nfc      PN532 over I2C (0x24)
 spidev>=3.5          # spi      mode/clock detail, loopback test
+                     # nfc      RC522 registers, PN532 over SPI
 pyserial>=3.5        # serial   port enumeration with USB provenance
+                     # nfc      PN532 over HSU (115200)
 lgpio>=0.2           # gpio     chip info and claimed lines
 Pillow>=10.0         # vm       QEMU screenshot -> PNG (else .ppm)
+                     # panel    the ST7735S canvas
+luma.lcd>=2.13       # panel    ST7735S over SPI (updev panel boot)

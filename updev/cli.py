@@ -29,6 +29,30 @@ from .ui.dash import Dashboard
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 
 
+class DeviceFirstGroup(click.Group):
+    """Also accept `updev <device> <verb>`, not just `updev <verb> <device>`.
+
+    Typing the thing you are holding before the thing you want to do to it is
+    how people describe it out loud ("this floppy drive — open its editor"),
+    and the rewrite is unambiguous: it only fires when the first word is not a
+    command and the second one is a verb that takes a device.
+    """
+
+    #: Verbs whose first argument is a device.
+    DEVICE_VERBS = frozenset({"gui", "tools", "show"})
+
+    def resolve_command(self, ctx, args):
+        if (
+            len(args) >= 2
+            and args[0] not in self.commands
+            and not args[0].startswith("-")
+            and args[1] in self.DEVICE_VERBS
+        ):
+            command = self.commands[args[1]]
+            return args[1], command, [args[0], *args[2:]]
+        return super().resolve_command(ctx, args)
+
+
 class State:
     """Shared plumbing hung off the click context."""
 
@@ -58,7 +82,8 @@ pass_state = click.make_pass_decorator(State, ensure=True)
 # root
 # ==========================================================================
 
-@click.group(context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
+@click.group(cls=DeviceFirstGroup, context_settings=CONTEXT_SETTINGS,
+             invoke_without_command=True)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
 @click.option("--no-color", is_flag=True, help="Disable ANSI colour.")
 @click.option("--deep", is_flag=True, help="Slower, more thorough probing (bus scans, LAN sweep).")
@@ -74,8 +99,11 @@ pass_state = click.make_pass_decorator(State, ensure=True)
 def cli(ctx, as_json, no_color, deep, timeout, backends, excluded, width):
     """updev — one device manager for the whole board.
 
-    LAN, USB, I2C, SPI, serial, cameras, GPIO, storage, Bluetooth and the
+    LAN, USB, I2C, SPI, serial, cameras, GPIO, storage, Bluetooth, NFC and the
     Raspberry Pi itself, in one place.
+
+    A device can come first: `updev 3-2 gui`, `updev sda tools`, `updev eth0
+    show` all work, as does the usual `updev gui 3-2`.
     """
     state = State()
     state.console = render.make_console(no_color=no_color, width=width)
@@ -279,6 +307,28 @@ def show(state: State, query):
         return
     for dev in matches:
         state.console.print(render.device_detail(dev))
+        _print_tools(state, dev)
+
+
+def _print_tools(state: State, dev) -> None:
+    """The tools that fit this device, under its detail panel.
+
+    Only for the kinds where `toolkit` knows more than the backend already
+    said — a USB device's tools come from its role and storage class, which
+    the backend never computed.
+    """
+    if dev.kind != Kind.USB or "root-hub" in dev.tags:
+        return
+    from .toolkit import annotate, recognize
+    from .ui.zone import tool_lines
+
+    recognition = recognize(dev)
+    annotate(recognition.tools)
+    if not recognition.tools:
+        return
+    state.console.print(Text("  할 수 있는 것", style="bold dim"))
+    state.console.print(tool_lines(recognition.tools))
+    state.console.print()
 
 
 @cli.command()
@@ -424,13 +474,17 @@ def usb():
               help="Seconds between polls.")
 @click.option("--existing", is_flag=True,
               help="Also classify whatever is already plugged in.")
+@click.option("--storage-only", is_flag=True,
+              help="Only react to mass storage, as the zone used to.")
 @click.option("-n", "--iterations", type=int, default=None, hidden=True)
 @pass_state
-def usb_zone(state: State, interval, existing, iterations):
-    """USB 체험존 — plug a device in and watch it get identified.
+def usb_zone(state: State, interval, existing, storage_only, iterations):
+    """USB 체험존 — plug anything in and watch it get identified.
 
-    Shows the class, the confidence, and every signature that went into the
-    decision, so a surprising answer can be argued with.
+    Shows what it is, every signature that went into that decision so a
+    surprising answer can be argued with, and the tools that fit it: a floppy
+    drive gets `updev floppy`, a camera gets camtoy, a keyboard gets an evdev
+    tap. Storage is classified by signature; everything else by role.
     """
     if state.as_json:
         raise click.UsageError("--json cannot be combined with zone; use `updev usb classify`")
@@ -439,7 +493,8 @@ def usb_zone(state: State, interval, existing, iterations):
     ctx = state.ctx
     if not ctx.include:
         ctx.include = FAST_BACKENDS
-    UsbZone(state.scanner, ctx, state.console, interval=interval).run(
+    UsbZone(state.scanner, ctx, state.console, interval=interval,
+            storage_only=storage_only).run(
         iterations=iterations, include_existing=existing
     )
 
@@ -1238,6 +1293,1968 @@ def floppy_info(state: State, image):
 
 
 # ==========================================================================
+# fly — the mushroom body that learns this board
+# ==========================================================================
+
+@cli.group()
+def fly():
+    """날파리가 이 보드를 관리한다 — 초파리 후각 학습 회로.
+
+    Threshold rules can't tell you that 78°C is normal *for this Pi with the
+    camera on* and 71°C at 3am is not. The fly's mushroom body answers exactly
+    that question with 2,000 neurons and no network: it learns what this board
+    smells like, and says when the smell changes.
+
+    Train it with `updev fly learn` whenever the board is in a state you
+    consider normal. Everything runs offline; nothing is downloaded.
+    """
+
+
+def _brain_and_verdict(state: State, path):
+    from .flybrain import load_brain
+
+    brain = load_brain(Path(path) if path else None)
+    result = state.scan()
+    return brain, result, brain.judge(result)
+
+
+def _verdict_panel(verdict, brain) -> Panel:
+    from .flybrain import COMPARTMENT_SPECS, GLOMERULI, MOOD_STYLE, RECENT
+
+    style = MOOD_STYLE[verdict.mood]
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("판정", Text(verdict.label, style=f"bold {style}"))
+    if verdict.recognition.label:
+        head.add_row("상태", Text(
+            verdict.recognition.summary,
+            style="bold cyan" if verdict.recognition.confident else "dim",
+        ))
+    head.add_row("aversion", _bar(verdict.aversion, "MBON-γ1pedc"))
+    head.add_row("학습 횟수", Text(f"{verdict.exposures}회", style="dim"))
+
+    body = [head]
+
+    # The three compartments, which is where the interesting reading lives:
+    # a board can be familiar over weeks and unfamiliar over minutes.
+    lobes = Table.grid(padding=(0, 2))
+    lobes.add_column(style="dim", justify="right", no_wrap=True)
+    lobes.add_column()
+    for key, title, half_life, _rate in COMPARTMENT_SPECS:
+        novelty = verdict.compartments.get(key)
+        if novelty is None:
+            continue
+        stale = key == RECENT and not verdict.recent_fresh
+        bar = _bar(novelty, _half_life_label(half_life))
+        if stale:
+            bar.append("  (오래 안 봐서 판단 보류)", style="dim italic")
+        lobes.add_row(title, bar)
+    body += [Text("\nnovelty — 구획별 (MBON-α'3)", style="bold"), lobes]
+
+    if verdict.recent_fresh and abs(verdict.drift) >= 0.05:
+        if verdict.drift > 0:
+            body.append(Text(
+                f"최근 모습과의 차이 +{verdict.drift:.2f} — 이 보드가 원래 하는 "
+                "일이지만 요즘 하던 건 아닙니다.", style="yellow"))
+        else:
+            body.append(Text(
+                f"최근 모습과의 차이 {verdict.drift:.2f} — 지금 지내고 있는 "
+                "상태입니다.", style="dim"))
+
+    if verdict.alarms:
+        alarms = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        alarms.add_column("경로", style="bright_red", no_wrap=True)
+        alarms.add_column("내용")
+        alarms.add_column("대응", style="dim", overflow="fold")
+        for alarm in verdict.alarms:
+            alarms.add_row(alarm.channel, alarm.message, alarm.detail)
+        body += [Text("\n측면뿔 (학습으로 끌 수 없음)", style="bold bright_red"), alarms]
+
+    smells = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+    smells.add_column("사구체", style="bold", no_wrap=True)
+    smells.add_column("반응", justify="right", width=7)
+    smells.add_column("", ratio=1)
+    for name, value in verdict.percept.strongest:
+        smells.add_row(name, f"{value:.3f}", _sparkbar(value))
+    body += [Text(f"\n가장 강한 냄새 ({len(GLOMERULI)}개 사구체 중)", style="bold"), smells]
+
+    if verdict.attend:
+        body.append(Text(
+            "\n중심복합체가 주목하는 곳: " + ", ".join(verdict.attend),
+            style="cyan",
+        ))
+    if verdict.should_learn:
+        body.append(Text(
+            "\n낯설지만 문제는 없다. 이게 정상이면: updev fly learn",
+            style="dim italic",
+        ))
+
+    return Panel(Group(*body), title=f"🪰  {verdict.mood}", title_align="left",
+                 border_style=style, box=box.ROUNDED)
+
+
+def _half_life_label(seconds: float) -> str:
+    """"20분", "12시간", "30일" — the timescale, in the unit that reads."""
+    if seconds < 3600:
+        return f"반감기 {seconds / 60:.0f}분"
+    if seconds < 86400:
+        return f"반감기 {seconds / 3600:.0f}시간"
+    return f"반감기 {seconds / 86400:.0f}일"
+
+
+def _bar(value: float, label: str, width: int = 24) -> Text:
+    filled = int(round(value * width))
+    style = "green" if value < 0.3 else "yellow" if value < 0.6 else "bright_red"
+    out = Text()
+    out.append("█" * filled, style=style)
+    out.append("░" * (width - filled), style="dim")
+    out.append(f"  {value:.2f}  ", style=style)
+    out.append(label, style="dim")
+    return out
+
+
+def _sparkbar(value: float, width: int = 18) -> Text:
+    filled = int(round(min(1.0, value) * width))
+    return Text("▉" * filled + "·" * (width - filled), style="dim cyan")
+
+
+@fly.command("sniff")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_sniff(state: State, path):
+    """지금 이 보드가 어떤 냄새인지 — 학습은 하지 않는다."""
+    brain, _, verdict = _brain_and_verdict(state, path)
+    if state.as_json:
+        state.emit({"verdict": verdict.as_dict(), "brain": brain.stats()})
+        return
+    state.console.print(_verdict_panel(verdict, brain))
+
+
+@fly.command("learn")
+@click.option("-n", "--times", type=int, default=1, show_default=True,
+              help="Repeat the exposure (one scan, imprinted N times).")
+@click.option("--as", "as_state", metavar="NAME",
+              help="Also teach this scan as a named state (e.g. idle, recording).")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_learn(state: State, times, as_state, path):
+    """지금 상태를 '정상'으로 각인시킨다.
+
+    Each compartment moves its own distance toward familiar, so the short-term
+    lobe settles in two or three calls and the long-term one — the number shown
+    as `novelty` — takes five or six. That is the point of having both. Issues
+    present at training time also write the aversive memory, so the fly learns
+    the shape *and* that the shape tends to go wrong.
+
+    `--as NAME` additionally teaches the scan as a named state, so the fly can
+    later say which of the states it knows the board is in. Naming is additive:
+    a named state is still a familiar one.
+    """
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+    result = state.scan()
+
+    # Teaching a name onto a smell that already belongs to a different name
+    # does not fail — it quietly makes both unreliable, and the damage only
+    # shows up later as "확실치 않음". It has happened three times here, each
+    # time because the thing being named had not actually happened: a mount
+    # that failed, a command joined with || instead of &&. The fly cannot know
+    # the intent, but it can see that this smells like something else already.
+    clash = _naming_clash(brain, result, as_state) if as_state else None
+    if clash and not state.as_json:
+        other, score = clash
+        state.console.print(Panel(
+            Text(f"지금 이 스캔은 이미 '{other}' 로 배운 냄새와 거의 같습니다 "
+                 f"(일치도 {score:.2f}).\n\n"
+                 f"'{as_state}' 로 가르치면 둘 다 구분이 안 되게 됩니다. "
+                 f"바꾸려던 상태가 실제로 바뀌었는지 확인하세요 — 마운트가 "
+                 f"정말 됐는지, 명령이 && 인지 || 인지.",
+                 style="yellow"),
+            title="같은 냄새", title_align="left",
+            border_style="yellow", box=box.ROUNDED))
+
+    before = None
+    for _ in range(max(1, times)):
+        verdict = brain.learn(result, state=as_state or "")
+        before = before or verdict
+    saved = brain.save(target)
+    after = brain.judge(result)
+
+    if state.as_json:
+        state.emit({
+            "before": before.as_dict(), "after": after.as_dict(),
+            "state": as_state or None,
+            "brain": brain.stats(), "path": str(saved),
+        })
+        return
+
+    state.console.print(_verdict_panel(after, brain))
+    tail = f"[dim]각인 완료 — novelty {before.novelty:.2f} → {after.novelty:.2f}, " \
+           f"누적 {brain.exposures}회"
+    if as_state:
+        tail += f" · 상태 이름 '{as_state}'"
+    state.console.print(tail + f" · {saved}[/dim]")
+
+
+def confirm_target(brain, recognition, state_name: str, anyway: bool):
+    """(state to reinforce, refusal). Exactly one of the two is set.
+
+    Split out of the command so the refusals can be tested, because they are
+    the part that matters. Agreeing with a correct reading is easy; declining
+    to agree with an uncertain one is what keeps a confused pair of states
+    from being trained further into each other.
+    """
+    if state_name:
+        if state_name not in brain.states:
+            known = ", ".join(sorted(brain.states)) or "(없음)"
+            return "", (f"'{state_name}' 는 배우지 않은 상태입니다. 아는 상태: {known}\n"
+                        f"새로 가르치려면:  updev fly learn --as {state_name}")
+        return state_name, ""
+
+    if not recognition.label:
+        return "", ("승인할 판정이 없습니다 — 아직 이름 붙은 상태를 배우지 않았습니다.\n"
+                    "먼저 가르치세요:  updev fly learn --as <이름>")
+
+    if recognition.score < recognition.FLOOR:
+        return "", (f"지금 상태는 아는 것 중 어느 것도 아닙니다 "
+                    f"(최고 {recognition.score:.2f}).\n"
+                    f"새 상태라면:  updev fly learn --as <이름>")
+
+    if not recognition.confident and not anyway:
+        runners = ", ".join(f"{n} {s:.2f}" for n, s in recognition.runners[:2])
+        return "", (f"'{recognition.label}' 같지만 확실하지 않습니다 "
+                    f"(격차 {recognition.margin:.3f}; {runners}).\n"
+                    f"애매한 판정을 승인하면 그 애매함이 학습됩니다.\n"
+                    f"어느 쪽인지 아시면:  updev fly yes <이름>\n"
+                    f"그래도 승인하려면:  updev fly yes --anyway")
+
+    return recognition.label, ""
+
+
+@fly.command("calm")
+@click.argument("duration", required=False, default="10m")
+@click.option("--off", is_flag=True, help="End the window now.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_calm(state: State, duration, off, path):
+    """정비 중이라고 알려 놀라지 않게 한다 — 기본 10분.
+
+    Unplugging things is how you work on a board, and every one of those reads
+    as novel. Without this the fly spends a maintenance session startled at
+    the maintenance. Animals suppress sensation they caused themselves; this
+    is the same thing, declared out loud because the fly cannot see hands.
+
+    It holds back learned surprise and stops reflexes firing. It does not
+    touch the lateral horn: a full disk or a dead backend still alarms, and a
+    calm signal that could mute those would undo the only guarantee here.
+
+    DURATION accepts 30s, 10m, 2h.
+    """
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+
+    if off:
+        brain.calm_until = 0.0
+        brain.save(target)
+        state.console.print("[dim]정비 창을 닫았습니다 — 다시 놀랍니다.[/dim]")
+        return
+
+    seconds = _parse_duration(duration)
+    if seconds <= 0:
+        raise click.ClickException(f"기간을 알 수 없습니다: {duration} (예: 30s, 10m, 2h)")
+    brain.calm_until = time.time() + seconds
+    brain.save(target)
+
+    if state.as_json:
+        state.emit({"calm_until": brain.calm_until, "seconds": seconds})
+        return
+    until = time.strftime("%H:%M:%S", time.localtime(brain.calm_until))
+    state.console.print(
+        f"[bold blue]진정 — {until} 까지 놀라지 않습니다.[/bold blue]")
+    state.console.print(
+        "[dim]측면뿔은 그대로입니다. 디스크가 꽉 차거나 백엔드가 죽으면 "
+        "여전히 경보합니다.  일찍 끝내려면: updev fly calm --off[/dim]")
+
+
+def _parse_duration(text: str) -> float:
+    """30s / 10m / 2h / a bare number of seconds."""
+    text = (text or "").strip().lower()
+    if not text:
+        return 0.0
+    unit = {"s": 1, "m": 60, "h": 3600}.get(text[-1])
+    try:
+        return float(text[:-1]) * unit if unit else float(text)
+    except ValueError:
+        return 0.0
+
+
+@fly.command("undo")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_undo(state: State, path):
+    """방금 가르친 것을 취소한다 — "말실수 했음".
+
+    Every write keeps the version it replaced, so the last `learn` or `yes`
+    can be taken back.
+
+    One *save*, which is not always one lesson: `learn -n 20` writes once and
+    undoing it drops all twenty. The count is printed before and after so the
+    size of the step is never a surprise.
+    """
+    import shutil
+
+    from .flybrain import brain_path, load_brain, previous_path
+
+    target = Path(path) if path else brain_path()
+    prev = previous_path(target)
+    if not prev.exists():
+        raise click.ClickException(
+            f"되돌릴 판본이 없습니다 — {prev.name} 이 아직 만들어지지 않았습니다.\n"
+            "저장이 한 번이라도 일어난 뒤에야 직전 상태가 생깁니다.")
+
+    current = load_brain(target)
+    undone = current.last_action
+    before_count = current.exposures
+    shutil.copyfile(prev, target)
+    from .flybrain import _restore_ownership
+
+    _restore_ownership(target)
+    now = load_brain(target)
+
+    if state.as_json:
+        state.emit({"undone": undone, "brain": now.stats(), "path": str(target)})
+        return
+
+    what = undone.get("state") or "(이름 없는 학습)"
+    dropped = before_count - now.exposures
+    state.console.print(
+        f"[yellow]되돌렸습니다 — 직전 저장 '{what}' 취소, 학습 {dropped}회 버림[/yellow]")
+    state.console.print(
+        f"[dim]누적 {before_count} → {now.exposures}회 · "
+        f"상태 {sorted(now.states) or '없음'} · {target}[/dim]")
+
+
+@fly.command("yes")
+@click.argument("state_name", metavar="[STATE]", required=False)
+@click.option("-n", "--times", type=int, default=1, show_default=True,
+              help="Reinforce this many times.")
+@click.option("--anyway", is_flag=True,
+              help="Confirm even when the fly is not sure which state it is.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_yes(state: State, state_name, times, anyway, path):
+    """방금 판정이 맞다고 승인한다 — "그거 맞음".
+
+    `fly sniff` says which state it thinks the board is in. This agrees with
+    it and reinforces that state, without retyping the name.
+
+    It refuses when the fly is not sure, and that refusal is the point. An
+    uncertain reading means two states already overlap; agreeing with the
+    coin-flip trains the overlap in and makes both of them worse. Pass a name
+    to say which one it should have been, or `--anyway` to confirm the guess.
+    """
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+    result = state.scan()
+    verdict = brain.judge(result)
+    recognition = verdict.recognition
+
+    chosen, refusal = confirm_target(brain, recognition, state_name, anyway)
+    if refusal:
+        raise click.ClickException(refusal)
+
+    before = recognition.score
+    for _ in range(max(1, times)):
+        brain.learn(result, state=chosen)
+    saved = brain.save(target)
+    after = brain.judge(result).recognition
+
+    if state.as_json:
+        state.emit({
+            "confirmed": chosen,
+            "score_before": round(before, 4),
+            "score_after": round(after.score, 4),
+            "brain": brain.stats(), "path": str(saved),
+        })
+        return
+
+    corrected = bool(state_name) and state_name != recognition.label
+    head = f"[bold green]'{chosen}' 확인[/bold green]" if not corrected else \
+           f"[bold yellow]'{recognition.label}' 이 아니라 '{chosen}' 으로 정정[/bold yellow]"
+    state.console.print(head)
+    state.console.print(
+        f"[dim]일치도 {before:.3f} → {after.score:.3f}, 누적 {brain.exposures}회 · {saved}[/dim]")
+
+
+#: A different state scoring at least this on the scan being taught means the
+#: two are, as far as the receptors go, the same thing.
+NAMING_CLASH = 0.80
+
+
+def _naming_clash(brain, result, name: str):
+    """(other state, score) when this scan already belongs to a different name.
+
+    Checked before learning rather than after, because after one exposure the
+    new name scores high on its own account and the collision is hidden.
+    """
+    from .flybrain import smell
+
+    if not brain.states:
+        return None
+    recognition = brain.recognize(smell(result))
+    scores = [(recognition.label, recognition.score)] + recognition.runners
+    for other, score in scores:
+        if other and other != name and score >= NAMING_CLASH:
+            return other, score
+    return None
+
+
+@fly.command("states")
+@click.option("--forget", "drop", metavar="NAME",
+              help="Forget one named state.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_states(state: State, drop, path):
+    """이름 붙여 가르친 상태들, 그리고 지금은 어느 쪽인지."""
+    from .flybrain import load_brain
+
+    target = Path(path) if path else None
+    brain = load_brain(target)
+
+    if drop:
+        if brain.forget(state=drop):
+            brain.save(target)
+            state.console.print(f"[yellow]'{drop}' 를 잊었습니다.[/yellow]")
+        else:
+            raise click.ClickException(f"그런 상태가 없습니다: {drop}")
+        return
+
+    if not brain.states:
+        if state.as_json:
+            state.emit({"states": {}, "current": None})
+            return
+        state.console.print(Panel(
+            Text("이름 붙은 상태가 없습니다.\n\n"
+                 "보드가 어떤 상태일 때 이름을 붙여 가르치면, 이후 그게 어떤 "
+                 "상태인지 말해줍니다:\n\n"
+                 "  updev fly learn --as idle\n"
+                 "  updev fly learn --as recording\n\n"
+                 "상태마다 서너 번씩 가르치면 구분이 섭니다.", style="dim"),
+            title="🪰  states", title_align="left",
+            border_style="dim", box=box.ROUNDED,
+        ))
+        return
+
+    result = state.scan()
+    verdict = brain.judge(result)
+    recognition = verdict.recognition
+
+    if state.as_json:
+        state.emit({
+            "states": brain.stats()["states"],
+            "current": recognition.as_dict(),
+        })
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    table.add_column("상태", style="bold", no_wrap=True)
+    table.add_column("일치도", justify="right", width=8)
+    table.add_column("", ratio=1)
+
+    scores = dict([(recognition.label, recognition.score)] + recognition.runners)
+    for name in sorted(brain.states):
+        score = scores.get(name, 0.0)
+        current = name == recognition.label and recognition.score >= recognition.FLOOR
+        table.add_row(
+            Text(name, style="bold cyan" if current else "bold"),
+            f"{score:.3f}",
+            _sparkbar(score),
+        )
+
+    state.console.print(Panel(
+        Group(table, Text(f"\n지금: {recognition.summary}",
+                          style="bold cyan" if recognition.confident else "yellow")),
+        title="🪰  states", title_align="left",
+        border_style="cyan", box=box.ROUNDED,
+    ))
+
+
+@fly.command("watch")
+@click.option("-i", "--interval", type=float, default=5.0, show_default=True,
+              help="Seconds between sniffs.")
+@click.option("-n", "--iterations", type=int, default=None,
+              help="Stop after this many sniffs.")
+@click.option("--quiet", is_flag=True,
+              help="Only print when the mood is not 'settled'.")
+@click.option("--act", is_flag=True,
+              help="Fire armed reflexes. Without this they are only reported.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_watch(state: State, interval, iterations, quiet, act, path):
+    """계속 냄새를 맡으며 낯선 변화가 생기면 알린다.
+
+    `--act` 를 주면 무장된 반사를 실제로 실행한다. 이게 tty에 상주하는 형태다 —
+    날파리가 계속 냄새를 맡다가, 아는 상태에 들어서면 배운 명령을 돌린다.
+    """
+    from .flybrain import MOOD_STYLE, Mood, load_brain
+
+    if state.as_json:
+        raise click.UsageError("--json cannot be combined with watch")
+
+    brain = load_brain(Path(path) if path else None)
+    if not brain.exposures:
+        state.console.print(
+            "[yellow]아직 학습되지 않은 뇌입니다 — 모든 게 낯설게 보입니다. "
+            "먼저 `updev fly learn`을 몇 번 실행하세요.[/yellow]\n"
+        )
+
+    book, book_path = _load_reflexes(path)
+    armed = [r for r in book.reflexes.values() if r.armed]
+    if armed:
+        how = "실행" if act else "보고만"
+        state.console.print(
+            f"[dim]무장된 반사 {len(armed)}개 ({', '.join(r.state for r in armed)}) — "
+            f"{how}합니다.[/dim]")
+    elif act:
+        state.console.print(
+            "[yellow]--act 를 줬지만 무장된 반사가 없습니다 — "
+            "updev fly reflex arm <상태> --yes[/yellow]")
+
+    count = 0
+    previous = None
+    previous_state = ""
+    try:
+        while iterations is None or count < iterations:
+            verdict = brain.judge(state.scan())
+            changed = previous is None or verdict.mood is not previous
+            if not quiet or verdict.mood is not Mood.SETTLED or changed:
+                stamp = time.strftime("%H:%M:%S")
+                line = Text(f"{stamp}  ", style="dim")
+                line.append(f"{verdict.mood:9s}", style=f"bold {MOOD_STYLE[verdict.mood]}")
+                line.append(f"  novelty {verdict.novelty:.2f}", style="dim")
+                if verdict.recognition.confident:
+                    line.append(f"  [{verdict.recognition.label}]", style="cyan")
+                if verdict.aversion > 0.1:
+                    line.append(f"  aversion {verdict.aversion:.2f}", style="magenta")
+                if verdict.attend:
+                    line.append(f"  ← {', '.join(verdict.attend[:2])}", style="cyan")
+                state.console.print(line)
+                for alarm in verdict.alarms:
+                    state.console.print(
+                        f"    [bright_red]{alarm.channel}[/bright_red] {alarm.message}"
+                    )
+
+            firing = book.consider(verdict, previous_state, dry_run=not act)
+            if firing is not None:
+                _print_firing_line(state, firing)
+                if firing.ran:
+                    _save_reflexes(book, book_path)
+
+            # Only advance the remembered state on a confident reading, so a
+            # moment of ambiguity does not count as having left the state and
+            # re-fire the reflex on the way back in.
+            if verdict.recognition.confident:
+                previous_state = verdict.recognition.label
+            previous = verdict.mood
+            count += 1
+            if iterations is None or count < iterations:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        state.console.print("[dim]중단됨[/dim]")
+
+
+def _print_firing_line(state: State, firing) -> None:
+    """One indented line per reflex decision, to sit under the watch line."""
+    mark = "▶" if firing.ran else "·"
+    if firing.ran:
+        style = "green" if firing.ok else "bright_red"
+        detail = f"rc={firing.status} ({firing.duration:.2f}s)"
+    else:
+        style = "dim"
+        detail = firing.refused
+    line = Text(f"    {mark} reflex ", style=style)
+    line.append(firing.reflex.state, style="bold cyan")
+    line.append(f"  {detail}", style=style)
+    state.console.print(line)
+    for stream, colour in ((firing.stdout, "dim"), (firing.stderr, "red")):
+        for row in stream.splitlines()[:3]:
+            state.console.print(Text(f"        {row}", style=colour))
+
+
+@fly.command("floppy")
+@click.option("--surface", is_flag=True,
+              help="Read every sector to find bad ones. Read-only, but slow.")
+@click.option("--budget", type=float, default=None,
+              help="Seconds to allow the surface scan (0 = no limit).")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_floppy(state: State, surface, budget, path):
+    """날파리가 플로피 드라이브를 관리한다.
+
+    Finds every USB floppy drive, reports whether a disk is in it and whether
+    that disk can still be read, and folds the answer into the fly's judgement
+    — a drive appearing is a change in what this board *is*, which is exactly
+    what the mushroom body is for.
+
+    `--surface` reads all 2,880 sectors to find the bad ones. It is the only
+    way to know: a failing floppy reports full capacity and online status right
+    up until the sector you needed. Nothing here ever writes to a disk.
+    """
+    from .fdd import DEFAULT_BUDGET, find_drives, medium_problems, read_medium, surface_scan
+    from .flybrain import load_brain
+
+    brain = load_brain(Path(path) if path else None)
+    result = state.scan()
+    drives = find_drives(result)
+    verdict = brain.judge(result)
+
+    if not drives:
+        if state.as_json:
+            state.emit({"drives": [], "verdict": verdict.as_dict()})
+            return
+        state.console.print(Panel(
+            Text("플로피 드라이브가 없습니다.\n\n"
+                 "USB 플로피를 꽂으면 usbclass가 FUSB로 판정하고, 날파리는 "
+                 "그걸 이 보드의 냄새가 바뀐 것으로 감지합니다.", style="dim"),
+            title="🪰  fdd", title_align="left", border_style="dim", box=box.ROUNDED,
+        ))
+        return
+
+    from .flybrain import Alarm, Mood
+
+    payload = []
+    for drive in drives:
+        medium = read_medium(drive.node) if drive.has_medium and drive.node else None
+        scan = None
+        if surface and drive.has_medium and drive.node:
+            scan = _run_surface(state, drive, budget if budget is not None else DEFAULT_BUDGET)
+        problems = medium_problems(drive, medium, scan)
+        payload.append({
+            "drive": drive.as_dict(),
+            "medium": medium.as_dict() if medium else None,
+            "surface": scan.as_dict() if scan else None,
+            "problems": [{"message": m, "advice": a} for m, a in problems],
+        })
+
+        # Fold them into the verdict for real, rather than printing them beside
+        # it: a damaged disk is exactly the kind of thing the lateral horn
+        # exists for, and it must outrank however familiar the board smells.
+        for message, advice in problems:
+            verdict.alarms.append(Alarm("floppy", f"{drive.label}: {message}", advice))
+        if problems:
+            verdict.mood = Mood.ALARMED
+
+        if not state.as_json:
+            state.console.print(_fdd_panel(drive, medium, scan, problems))
+
+    if state.as_json:
+        state.emit({"drives": payload, "verdict": verdict.as_dict()})
+        return
+
+    state.console.print(_verdict_panel(verdict, brain))
+
+
+def _run_surface(state: State, drive, budget: float):
+    """Drive the scan with a live progress bar — it is far too slow to be silent."""
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+
+    from .fdd import surface_scan
+
+    final = None
+    with Progress(
+        TextColumn("[cyan]표면 스캔"),
+        BarColumn(bar_width=30),
+        TextColumn("{task.completed}/{task.total} 섹터"),
+        TextColumn("[red]{task.fields[bad]} bad"),
+        TimeElapsedColumn(),
+        console=state.console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("scan", total=0, bad=0)
+        for surface in surface_scan(drive.node, give_up_after=300, budget=budget):
+            progress.update(task, total=surface.total, completed=surface.scanned,
+                            bad=len(surface.bad))
+            final = surface
+    return final
+
+
+def _fdd_panel(drive, medium, surface, problems) -> Panel:
+    from .fdd import FLOPPY_SIZE
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("드라이브", Text(drive.label, style="bold"))
+    head.add_row("USB", Text(drive.usb_address or "-", style="dim"))
+    head.add_row("장치", Text(drive.node or "(매체 없음)", style="dim"))
+
+    if not drive.has_medium:
+        head.add_row("디스켓", Text("없음 — 드라이브는 정상", style="yellow"))
+        return Panel(head, title="🪰  fdd", title_align="left",
+                     border_style="yellow", box=box.ROUNDED)
+
+    geometry = "1.44MB 표준" if drive.standard_geometry else f"{drive.size:,} 바이트"
+    head.add_row("디스켓", Text(f"있음 · {geometry}",
+                              style="green" if drive.standard_geometry else "yellow"))
+    if medium:
+        head.add_row("내용", Text(medium.summary,
+                                style="green" if medium.fat12 else "yellow"))
+
+    body = [head]
+
+    if medium and medium.files:
+        from .fdd import is_textual, read_file
+
+        listing = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        listing.add_column("파일", style="bold", no_wrap=True)
+        listing.add_column("바이트", justify="right", no_wrap=True)
+        listing.add_column("내용", overflow="fold", ratio=1)
+        for entry in medium.files:
+            # One read per file, following its own FAT chain. A listing that
+            # only gives names makes you reach for `mount` to answer "what is
+            # actually on this", which on a failing floppy is the one thing
+            # worth not doing.
+            blob = read_file(medium.node, entry, medium.system)
+            if not blob:
+                preview = Text("읽을 수 없음", style="red")
+            elif is_textual(blob):
+                text = blob.decode("ascii", "replace")
+                lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+                shown = " ⏎ ".join(lines[:3])[:160]
+                more = "…" if len(lines) > 3 or len(blob) < entry["size"] else ""
+                preview = Text(shown + more, style="dim")
+            else:
+                preview = Text(f"바이너리 · {blob[:8].hex(' ').upper()}…", style="dim cyan")
+            listing.add_row(entry["name"], f"{entry['size']:,}", preview)
+        body += [Text("\n루트 디렉터리", style="bold"), listing]
+    elif medium and medium.fat12:
+        body.append(Text("\n포맷은 되어 있지만 파일이 없습니다 — 빈 디스켓입니다.",
+                         style="dim italic"))
+
+    if surface is not None:
+        pct = surface.good / surface.scanned * 100 if surface.scanned else 0
+        style = "green" if surface.healthy else "bright_red"
+        stat = Table.grid(padding=(0, 2))
+        stat.add_column(style="dim", justify="right", no_wrap=True)
+        stat.add_column()
+        stat.add_row("확인한 섹터", Text(f"{surface.scanned:,} / {surface.total:,}"))
+        stat.add_row("읽힘", Text(f"{surface.good:,}  ({pct:.1f}%)", style=style))
+        stat.add_row("배드섹터", Text(f"{len(surface.bad):,}",
+                                   style="green" if surface.healthy else "bright_red"))
+        if surface.bad:
+            runs = ", ".join(f"{a}" if a == b else f"{a}–{b}"
+                             for a, b in surface.bad_ranges()[:10])
+            more = "" if len(surface.bad_ranges()) <= 10 else " …"
+            stat.add_row("위치", Text(runs + more, style="red", overflow="fold"))
+        if surface.aborted:
+            stat.add_row("중단", Text(surface.aborted, style="yellow"))
+        body += [Text("\n표면 스캔", style="bold"), stat]
+    elif drive.has_medium:
+        body.append(Text(
+            "\n배드섹터는 --surface 로 전수 검사해야 알 수 있습니다 "
+            "(읽기 전용, 1분 안팎).", style="dim italic"))
+
+    if problems:
+        trouble = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        trouble.add_column("문제", style="bright_red", overflow="fold")
+        trouble.add_column("대응", style="dim", overflow="fold")
+        for message, advice in problems:
+            trouble.add_row(message, advice)
+        body += [Text("\n측면뿔", style="bold bright_red"), trouble]
+
+    border = "bright_red" if problems else "bright_magenta"
+    return Panel(Group(*body), title="🪰  fdd", title_align="left",
+                 border_style=border, box=box.ROUNDED)
+
+
+def _load_reflexes(path):
+    """Read the reflex book that sits beside this brain file."""
+    import json
+
+    from .flybrain import reflex_path
+    from .reflex import ReflexBook
+
+    target = reflex_path(Path(path) if path else None)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ReflexBook(), target
+    return ReflexBook.from_dict(data), target
+
+
+def _save_reflexes(book, target: Path) -> Path:
+    import json
+
+    from .flybrain import _restore_ownership
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(book.as_dict(), indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, target)
+    _restore_ownership(target)
+    return target
+
+
+@fly.group("reflex")
+def fly_reflex():
+    """상태를 보고 명령을 실행하는 반사 — 버섯체의 출력단.
+
+    A mushroom body that only recognises is half a circuit. Its output neurons
+    are premotor: they exist to turn "I know this smell" into "so do this".
+
+    A reflex binds one named state to one command. The fly watches, names the
+    state, and runs what it was taught. It does not write the command — you do,
+    once. What it contributes is deciding *when*.
+
+    Reflexes never fire while the lateral horn is alarming, never fire on an
+    uncertain recognition, fire only on entering a state rather than for as
+    long as it lasts, and do nothing at all until armed.
+    """
+
+
+@fly_reflex.command("teach")
+@click.argument("state")
+@click.argument("command")
+@click.option("--timeout", type=float, default=None,
+              help="Seconds before the command is killed.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_teach(state: State, state_name, command, timeout, path):
+    """STATE 일 때 COMMAND 를 실행하도록 가르친다. 무장은 따로 한다."""
+    from .flybrain import load_brain
+    from .reflex import DEFAULT_TIMEOUT, looks_destructive
+
+    brain = load_brain(Path(path) if path else None)
+    if state_name not in brain.states:
+        known = ", ".join(sorted(brain.states)) or "(없음)"
+        raise click.ClickException(
+            f"'{state_name}' 는 배우지 않은 상태입니다. 아는 상태: {known}\n"
+            f"먼저 가르치세요:  updev fly learn --as {state_name}"
+        )
+
+    book, target = _load_reflexes(path)
+    reflex = book.teach(state_name, command,
+                        timeout=timeout if timeout is not None else DEFAULT_TIMEOUT)
+    _save_reflexes(book, target)
+
+    if state.as_json:
+        state.emit({"reflex": reflex.as_dict(), "path": str(target)})
+        return
+
+    state.console.print(
+        f"[green]'{state_name}' → [/green][bold]{command}[/bold]")
+    warnings = looks_destructive(command)
+    if warnings:
+        state.console.print(Panel(
+            Text("\n".join(warnings) + "\n\n"
+                 "직접 칠 때와 스스로 도는 것은 다릅니다. 무장 전에 다시 보세요.",
+                 style="yellow"),
+            title="주의", title_align="left",
+            border_style="yellow", box=box.ROUNDED))
+    state.console.print(
+        f"[dim]아직 무장되지 않았습니다 — 시험:  updev fly reflex test {state_name}\n"
+        f"무장:  updev fly reflex arm {state_name} --yes[/dim]")
+
+
+# `state` is taken by the State object, so the argument lands under another name.
+fly_reflex_teach.params[0].name = "state_name"
+
+
+@fly_reflex.command("list")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_list(state: State, path):
+    """가르친 반사들."""
+    from .reflex import preview
+
+    book, target = _load_reflexes(path)
+    if state.as_json:
+        state.emit({"reflexes": book.as_dict(), "path": str(target)})
+        return
+
+    if not book.reflexes:
+        state.console.print(Panel(
+            Text("반사가 없습니다.\n\n"
+                 "이름 붙여 가르친 상태에 명령을 묶으면, 날파리가 그 상태에 "
+                 "들어설 때 실행합니다:\n\n"
+                 "  updev fly reflex teach floppy-ejected 'logger 디스켓 빠짐'\n"
+                 "  updev fly reflex arm floppy-ejected --yes", style="dim"),
+            title="🪰  reflex", title_align="left",
+            border_style="dim", box=box.ROUNDED))
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    table.add_column("상태", style="bold", no_wrap=True)
+    table.add_column("무장", no_wrap=True, width=6)
+    table.add_column("명령", overflow="fold", ratio=1)
+    table.add_column("실행", justify="right", no_wrap=True)
+    table.add_column("마지막", no_wrap=True)
+    for reflex in book.reflexes.values():
+        if reflex.last_fired:
+            when = time.strftime("%m-%d %H:%M", time.localtime(reflex.last_fired))
+            when += " ok" if reflex.last_status == 0 else f" rc{reflex.last_status}"
+        else:
+            when = "-"
+        table.add_row(
+            reflex.state,
+            Text("ON" if reflex.armed else "off",
+                 style="bold green" if reflex.armed else "dim"),
+            preview(reflex.command, 80),
+            str(reflex.runs),
+            Text(when, style="dim" if reflex.last_status in (0, None) else "red"),
+        )
+    state.console.print(Panel(table, title="🪰  reflex", title_align="left",
+                              border_style="cyan", box=box.ROUNDED))
+
+
+@fly_reflex.command("arm")
+@click.argument("state_name", metavar="STATE")
+@click.option("--off", is_flag=True, help="Disarm instead.")
+@click.option("--yes", is_flag=True, help="Required — this lets the fly run it unattended.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_arm(state: State, state_name, off, yes, path):
+    """반사를 무장한다. --yes 가 필요하다.
+
+    Teaching a command and letting it run by itself are different decisions,
+    so they are different commands.
+    """
+    from .reflex import looks_destructive
+
+    book, target = _load_reflexes(path)
+    reflex = book.reflexes.get(state_name)
+    if reflex is None:
+        raise click.ClickException(f"그런 반사가 없습니다: {state_name}")
+
+    if not off and not yes:
+        warnings = looks_destructive(reflex.command)
+        state.console.print(Panel(
+            Group(
+                Text(reflex.command, style="bold"),
+                Text("\n이 명령이 앞으로 사람 없이 실행됩니다.", style="yellow"),
+                *([Text("\n" + "\n".join(warnings), style="bright_red")] if warnings else []),
+            ),
+            title="무장 전 확인", title_align="left",
+            border_style="yellow", box=box.ROUNDED))
+        state.console.print(
+            f"[dim]괜찮다면:[/] [bold cyan]updev fly reflex arm {state_name} --yes[/]")
+        raise SystemExit(1)
+
+    book.arm(state_name, on=not off)
+    _save_reflexes(book, target)
+    if state.as_json:
+        state.emit({"reflex": reflex.as_dict()})
+        return
+    if off:
+        state.console.print(f"[dim]'{state_name}' 무장 해제.[/dim]")
+    else:
+        state.console.print(
+            f"[bold green]'{state_name}' 무장됨.[/bold green] "
+            f"[dim]updev fly watch --act 로 돌리면 반응합니다.[/dim]")
+
+
+@fly_reflex.command("test")
+@click.argument("state_name", metavar="STATE")
+@click.option("--run", is_flag=True,
+              help="Actually run it, ignoring whether it is armed.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_test(state: State, state_name, run, path):
+    """반사를 한 번 실행해 본다 — 무장 여부와 무관하게, 지금 이 자리에서."""
+    book, _ = _load_reflexes(path)
+    reflex = book.reflexes.get(state_name)
+    if reflex is None:
+        raise click.ClickException(f"그런 반사가 없습니다: {state_name}")
+
+    if not run:
+        state.console.print(Panel(
+            Text(reflex.command, style="bold"),
+            title=f"'{state_name}' 가 실행할 명령", title_align="left",
+            border_style="cyan", box=box.ROUNDED))
+        state.console.print(
+            f"[dim]실제로 돌려보려면:[/] [bold cyan]updev fly reflex test {state_name} --run[/]")
+        return
+
+    firing = book.run(reflex)
+    _save_reflexes(book, _load_reflexes(path)[1])
+    if state.as_json:
+        state.emit(firing.as_dict())
+        return
+    state.console.print(_firing_panel(firing))
+
+
+@fly_reflex.command("forget")
+@click.argument("state_name", metavar="STATE")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_reflex_forget(state: State, state_name, path):
+    """반사를 지운다. 상태 자체는 남는다."""
+    book, target = _load_reflexes(path)
+    if not book.drop(state_name):
+        raise click.ClickException(f"그런 반사가 없습니다: {state_name}")
+    _save_reflexes(book, target)
+    state.console.print(f"[yellow]'{state_name}' 반사를 지웠습니다.[/yellow] "
+                        f"[dim](상태 학습은 그대로)[/dim]")
+
+
+def _firing_panel(firing) -> Panel:
+    reflex = firing.reflex
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("상태", Text(reflex.state, style="bold cyan"))
+    head.add_row("명령", Text(reflex.command, style="bold", overflow="fold"))
+    if firing.ran:
+        head.add_row("결과", Text(
+            f"rc={firing.status}  ({firing.duration:.2f}s)",
+            style="green" if firing.ok else "bright_red"))
+    else:
+        head.add_row("실행 안 함", Text(firing.refused, style="yellow", overflow="fold"))
+
+    body = [head]
+    if firing.stdout:
+        body += [Text("\nstdout", style="dim bold"), Text(firing.stdout)]
+    if firing.stderr:
+        body += [Text("\nstderr", style="dim bold"), Text(firing.stderr, style="red")]
+
+    return Panel(Group(*body), title="🪰  reflex", title_align="left",
+                 border_style="green" if firing.ok else
+                 "yellow" if not firing.ran else "bright_red",
+                 box=box.ROUNDED)
+
+
+@fly.command("brain")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_brain(state: State, path):
+    """회로 구성과 지금까지 학습된 기억."""
+    from .flybrain import (
+        ANTENNAL_LOBE_GLOMERULI,
+        CLAWS_PER_KENYON_CELL,
+        GLOMERULI,
+        KENYON_CELLS,
+        SPARSITY,
+        TAG_BITS,
+        brain_path,
+        load_brain,
+    )
+
+    target = Path(path) if path else brain_path()
+    brain = load_brain(target)
+    stats = brain.stats()
+    if state.as_json:
+        state.emit({"path": str(target), "stats": stats, "glomeruli": list(GLOMERULI)})
+        return
+
+    circuit = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    circuit.add_column("단계", style="bold", no_wrap=True)
+    circuit.add_column("수", justify="right", no_wrap=True)
+    circuit.add_column("하는 일", style="dim", overflow="fold", ratio=1)
+    circuit.add_row("사구체 (촉각엽)", f"{len(GLOMERULI)}",
+                    f"스캔의 특징 하나씩. 실제 초파리도 {ANTENNAL_LOBE_GLOMERULI}개")
+    circuit.add_row("투사뉴런", f"{len(GLOMERULI)}",
+                    "분할 정규화 — 기기 수가 많다고 다 켜지지 않게")
+    circuit.add_row("케니언세포 (버섯체)", f"{KENYON_CELLS:,}",
+                    f"각자 사구체 {CLAWS_PER_KENYON_CELL}개를 무작위로 물고 있음")
+    circuit.add_row("APL 억제뉴런", "1",
+                    f"상위 {SPARSITY:.0%}만 남김 → {TAG_BITS}비트 희소 태그")
+    circuit.add_row("구획", str(len(stats["compartments"])),
+                    "γ·α'β'·αβ — 같은 냄새를 서로 다른 속도로 잊는다")
+    circuit.add_row("MBON", "2", "α'3 = 낯섦, γ1pedc = 위험")
+    circuit.add_row("측면뿔", "—", "학습을 거치지 않는 선천적 경보")
+
+    lobes = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+    lobes.add_column("구획", style="bold", no_wrap=True)
+    lobes.add_column("반감기", justify="right", no_wrap=True)
+    lobes.add_column("학습률", justify="right", no_wrap=True)
+    lobes.add_column("세포", justify="right", no_wrap=True)
+    lobes.add_column("남은 기억", justify="right", no_wrap=True)
+    for comp in stats["compartments"]:
+        lobes.add_row(
+            comp["title"],
+            _half_life_label(comp["half_life"]).removeprefix("반감기 "),
+            f"{comp['rate']:.2f}",
+            f"{comp['cells']:,}",
+            Text(f"{comp['retention']:.0%}",
+                 style="green" if comp["retention"] > 0.5 else "dim"),
+        )
+
+    memory = Table.grid(padding=(0, 2))
+    memory.add_column(style="dim", justify="right", no_wrap=True)
+    memory.add_column()
+    memory.add_row("학습 횟수", Text(f"{stats['exposures']}회",
+                                 style="green" if stats["exposures"] else "yellow"))
+    memory.add_row("기억된 세포", Text(
+        f"{stats['cells_touched']:,} / {KENYON_CELLS:,}  ({stats['coverage']:.1%})"))
+    memory.add_row("위험 기억 세포", Text(f"{stats['aversive_cells']:,}"))
+    if stats["states"]:
+        memory.add_row("이름 붙은 상태", Text(
+            ", ".join(f"{n}" for n in stats["states"]), style="cyan"))
+    memory.add_row("파일", Text(str(target), style="dim"))
+    if stats["exposures"]:
+        memory.add_row("마지막 학습", Text(
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(stats["updated"])), style="dim"))
+    if brain.reset_reason:
+        memory.add_row("", Text(brain.reset_reason, style="bright_red", overflow="fold"))
+        if brain.lost_states:
+            memory.add_row("", Text(
+                "다시 가르쳐야 할 상태: "
+                + ", ".join(f"updev fly learn --as {n}" for n in brain.lost_states),
+                style="yellow", overflow="fold"))
+    elif not stats["exposures"]:
+        memory.add_row("", Text("아직 아무것도 모릅니다 — updev fly learn", style="yellow"))
+
+    state.console.print(Panel(Group(circuit, Text(), lobes), title="회로",
+                              title_align="left", border_style="bright_magenta",
+                              box=box.ROUNDED))
+    state.console.print(Panel(memory, title="기억", title_align="left",
+                              border_style="cyan", box=box.ROUNDED))
+
+
+@fly.command("forget")
+@click.option("--yes", is_flag=True, help="Skip the confirmation.")
+@click.option("--brain", "path", type=click.Path(dir_okay=False),
+              help="Use this memory file instead of the default.")
+@pass_state
+def fly_forget(state: State, yes, path):
+    """학습된 기억을 모두 지운다."""
+    from .flybrain import FlyBrain, brain_path
+
+    target = Path(path) if path else brain_path()
+    if not target.exists():
+        state.console.print(f"[dim]학습된 기억이 없습니다 — {target}[/dim]")
+        return
+    if not yes:
+        click.confirm(f"{target} 의 기억을 지웁니다. 계속할까요?", abort=True)
+    brain = FlyBrain()
+    brain.save(target)
+    state.console.print(f"[yellow]잊었습니다 — 다시 갓 부화한 상태입니다.[/yellow] [dim]{target}[/dim]")
+
+
+# ==========================================================================
+# algo — which algorithms a binary's constants point to
+# ==========================================================================
+
+@cli.command("algo")
+@click.argument("target", type=click.Path(exists=True, dir_okay=False), required=False)
+@click.option("--signatures", is_flag=True, help="Print the rule table and exit.")
+@click.option("--all", "show_all", is_flag=True, help="Include weak findings.")
+@pass_state
+def algo_command(state: State, target, signatures, show_all):
+    """실행 파일의 상수로 알고리즘을 알아낸다.
+
+    Most classic algorithms carry a number nothing else has any reason to
+    contain — 0xEDB88320 is the CRC-32 polynomial, 1103515245 is the ANSI C
+    `rand` multiplier. Finding one is identification, not a guess.
+
+    Two limits, stated because they matter: a constant is evidence rather than
+    proof, and **absence proves nothing** — a table-driven CRC never contains
+    its own polynomial, and a fixed-width ISA splits constants across
+    instructions. Read-only; nothing is executed.
+    """
+    from .algo import SIGNATURES, Strength, analyse, signature_reference
+
+    if signatures:
+        rules = signature_reference()
+        if state.as_json:
+            state.emit({"signatures": rules})
+            return
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+        table.add_column("알고리즘", style="bold", no_wrap=True)
+        table.add_column("세기", no_wrap=True, width=8)
+        table.add_column("표지", overflow="fold", ratio=1, style="dim")
+        for rule in rules:
+            strength = rule["strength"]
+            table.add_row(
+                rule["algorithm"],
+                Text(strength, style="bold green" if strength == "unique" else
+                     "yellow" if strength == "strong" else "dim"),
+                rule["detail"],
+            )
+        state.console.print(Panel(
+            Group(table, Text(
+                "\nunique 는 그 숫자가 다른 뜻을 가질 이유가 없는 것, strong 은 "
+                "우연이기 어려운 것, weak 는 혼자서는 아무 뜻도 없는 것이다.",
+                style="dim italic")),
+            title="시그니처", title_align="left",
+            border_style="bright_magenta", box=box.ROUNDED))
+        return
+
+    if not target:
+        raise click.UsageError("파일을 지정하세요 (또는 --signatures)")
+
+    report = analyse(target)
+    if state.as_json:
+        state.emit(report.as_dict())
+        return
+    if report.error:
+        raise click.ClickException(report.error)
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column()
+    head.add_row("파일", Text(report.path, style="bold", overflow="fold"))
+    head.add_row("형식", Text(f"{report.kind} · {report.size:,} 바이트"))
+    if report.stripped is not None:
+        head.add_row("심볼", Text("stripped — 이름 없음" if report.stripped
+                                else "심볼 살아있음",
+                                style="yellow" if report.stripped else "green"))
+
+    body = [head]
+
+    findings = [f for f in report.findings
+                if show_all or f.strength is not Strength.WEAK]
+    hidden = len(report.findings) - len(findings)
+
+    if findings:
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim bold", expand=True)
+        table.add_column("알고리즘", style="bold", no_wrap=True)
+        table.add_column("판정", no_wrap=True, width=8)
+        table.add_column("근거", overflow="fold", ratio=1, style="dim")
+        for finding in findings:
+            evidence = "\n".join(
+                f"{e.where}: {e.what}"
+                + (f" @0x{e.offset:X}" if e.offset >= 0 else "")
+                + (f"\n  {e.detail}" if e.detail else "")
+                for e in finding.evidence[:3]
+            )
+            table.add_row(
+                Text(finding.label, style="bold"),
+                Text(str(finding.strength),
+                     style="bold green" if finding.certain else "yellow"),
+                evidence,
+            )
+        body += [Text("\n찾은 것", style="bold"), table]
+    else:
+        body.append(Text("\n알려진 시그니처가 없습니다.", style="yellow"))
+
+    if hidden:
+        body.append(Text(f"\nweak 근거 {hidden}개는 숨겼습니다 — --all 로 보기",
+                         style="dim italic"))
+
+    body.append(Text(
+        "\n없다고 나온 것이 없다는 증거는 아닙니다 — 테이블로 펼친 CRC 는 "
+        "다항식을 담지 않고, 고정폭 ISA 는 상수를 명령어에 쪼개 넣습니다.",
+        style="dim italic"))
+
+    state.console.print(Panel(
+        Group(*body), title="🔍  algo", title_align="left",
+        border_style="cyan" if findings else "yellow", box=box.ROUNDED))
+
+
+# ==========================================================================
+# tools — what to run on whatever is attached
+# ==========================================================================
+
+@cli.command("tools")
+@click.argument("target", required=False)
+@click.option("--brief", is_flag=True, help="One line per tool.")
+@pass_state
+def tools_command(state: State, target, brief):
+    """뭘 꽂았든, 그걸로 할 수 있는 것.
+
+    `updev usb zone` without the live screen. Identifies what is attached —
+    storage by signature, everything else by role — and lists the commands
+    that fit it. A USB floppy gets `updev floppy`; a thumb drive gets a read
+    benchmark; a keyboard gets an evdev tap; a wired NFC module gets the
+    reader.
+
+    TARGET is anything `updev show` accepts. Omit it for everything attached.
+    """
+    from .toolkit import annotate, recognize
+    from .ui.zone import tool_lines, tools_panel
+
+    result = state.scan()
+    if target:
+        devices = result.find(target)
+        if not devices:
+            state.console.print(f"[red]nothing matches[/] [bold]{target}[/]")
+            state.console.print("[dim]run[/] [bold cyan]updev scan[/] [dim]to list devices[/]")
+            raise SystemExit(1)
+    else:
+        devices = [
+            d for d in result.devices
+            if (d.kind == Kind.USB and "root-hub" not in d.tags)
+            or d.kind == Kind.NFC
+            or (d.kind == Kind.CAMERA and d.node)
+        ]
+
+    recognitions = []
+    for dev in devices:
+        recognition = recognize(dev)
+        annotate(recognition.tools)
+        recognitions.append(recognition)
+
+    if state.as_json:
+        state.emit({"devices": [r.as_dict() for r in recognitions]})
+        return
+
+    if not recognitions:
+        state.console.print("[yellow]nothing attached that updev has a tool for[/]")
+        state.console.print("[dim]plug something in, or run[/] "
+                            "[bold cyan]updev nfc wiring[/] [dim]to wire a reader[/]")
+        return
+
+    for recognition in recognitions:
+        dev = recognition.device
+        title = Text()
+        title.append(f" {recognition.badge} ", style="bold black on bright_yellow")
+        title.append(f"  {dev.label}", style="bold")
+        title.append(f"   {recognition.headline}", style="dim")
+        if brief:
+            state.console.print(title)
+            state.console.print(tool_lines(recognition.tools))
+            state.console.print()
+        else:
+            state.console.print(tools_panel(recognition, title=str(title.plain).strip()))
+
+
+
+# ==========================================================================
+# gui
+# ==========================================================================
+
+@cli.command("gui")
+@click.argument("target", required=False)
+@pass_state
+def gui_command(state: State, target):
+    """장치별 에디터 GUI — 꽂힌 것마다 그에 맞는 편집기.
+
+    TARGET is anything `updev show` accepts; omit it to browse everything.
+    `updev 3-2 gui` works too.
+
+    Plain tkinter, so there is nothing to install on Raspberry Pi OS. A USB
+    floppy gets the FAT12 editor, an NFC reader gets the tag editor, an I2C
+    chip gets its register space, a keyboard gets its event stream — and
+    anything else at least gets its full detail and the commands that fit it.
+    """
+    from .gui import available, launch
+
+    if state.as_json:
+        raise click.UsageError("--json cannot be combined with gui")
+
+    ok, why = available()
+    if not ok:
+        state.console.print(f"[red]GUI를 열 수 없습니다[/] — {why}")
+        state.console.print("[dim]터미널에서 같은 걸 보려면:[/] "
+                            "[bold cyan]updev tools[/]")
+        raise SystemExit(1)
+
+    result = state.scan()
+    launch(result, target=target or "", deep=state.ctx.deep)
+
+
+# ==========================================================================
+# disk — read-only measurement
+# ==========================================================================
+
+@cli.group()
+def disk():
+    """Measure a block device. Reads only — nothing here opens for writing."""
+
+
+@disk.command("bench")
+@click.argument("target")
+@click.option("--chunk", type=int, default=4, show_default=True,
+              help="MiB per sequential read.")
+@click.option("-n", "--reads", type=int, default=8, show_default=True,
+              help="How many sequential chunks.")
+@click.option("--seeks", type=int, default=48, show_default=True,
+              help="Random reads for the latency probe (0 skips it).")
+@click.option("--buffered", is_flag=True,
+              help="Skip O_DIRECT; drop the cache before each read instead.")
+@pass_state
+def disk_bench(state: State, target, chunk, reads, seeks, buffered):
+    """실제 읽기 속도 · 랜덤 접근 지연 — 링크 속도가 아니라 매체의 속도.
+
+    TARGET is a device node (/dev/sda) or a name updev knows (sda, the model).
+
+    The seek probe is the interesting half: `updev usb classify` decides HUSB
+    against SUSB from the drive's own VPD 0xB1 claim, and a median random read
+    latency either backs that up or catches the bridge lying.
+    """
+    from .bench import link_comparison, rotation_hint, run
+    from .core.util import human_bytes, usb_address_from_path
+
+    node = _resolve_block(state, target)
+    try:
+        result = run(node, chunk_mb=chunk, reads=reads, seeks=max(0, seeks),
+                     direct=not buffered)
+    except PermissionError:
+        state.console.print(f"[red]no read access to[/] [bold]{node}[/]")
+        state.console.print(f"[dim]raw sectors are root:disk. Either:[/] "
+                            f"[bold cyan]sudo updev disk bench {node}[/]")
+        state.console.print("[dim]or a udev rule scoped to this one device. Not the "
+                            "disk group — it hands over raw read/write on every "
+                            "block device, which is root by another name.[/]")
+        raise SystemExit(1)
+    except OSError as e:
+        state.console.print(f"[red]{node}: {e.strerror or e}[/]")
+        raise SystemExit(1)
+
+    payload = result.as_dict()
+
+    # Cross-checks: the negotiated link, and what the classifier decided.
+    name = Path(node).name
+    link_mbps = 0.0
+    address = ""
+    try:
+        real = str(Path(f"/sys/block/{name}").resolve())
+        address = usb_address_from_path(real)
+    except OSError:
+        pass
+    if address:
+        from .usbrole import build_path
+        for hop in build_path(address):
+            if hop.is_target:
+                link_mbps = float(hop.speed or 0)
+    payload["link_mbps"] = link_mbps
+    payload["usb_address"] = address
+
+    verdict = None
+    if address:
+        from .usbclass import UsbClass, classify, gather_facts
+        verdict = classify(gather_facts(usb_address=address))
+        payload["classifier"] = str(verdict.usb_class)
+
+    if state.as_json:
+        state.emit(payload)
+        return
+
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True, min_width=18)
+    head.add_column(overflow="fold")
+    head.add_row("device", Text(f"{node}   {human_bytes(result.size_bytes)}", style="bold"))
+    head.add_row("sequential read",
+                 Text(f"{result.throughput_mbs:.1f} MB/s", style="bold bright_green")
+                 .append(f"   (median chunk {result.steady_mbs:.1f} MB/s, "
+                         f"{result.reads} × {result.chunk_bytes // (1024 * 1024)} MiB)",
+                         style="dim"))
+    if link_mbps:
+        head.add_row("versus the link", Text(link_comparison(result.throughput_mbs, link_mbps)))
+    if result.seek_ms:
+        spin, reason = rotation_hint(result.seek_median)
+        line = Text(f"{result.seek_median:.2f} ms", style="bold")
+        line.append(f"   → {spin}", style="bold cyan")
+        head.add_row("random read (median)", line)
+        head.add_row("", Text(reason, style="dim italic"))
+    head.add_row("io", Text("O_DIRECT" if result.direct else "buffered, cache dropped",
+                            style="dim"))
+    if result.note:
+        head.add_row("", Text(result.note, style="dim"))
+
+    body = [head]
+    if verdict is not None:
+        from .usbclass import UsbClass
+        spin, _ = rotation_hint(result.seek_median)
+        expected = {UsbClass.HUSB: "rotating", UsbClass.SUSB: "solid-state",
+                    UsbClass.NUSB: "solid-state"}.get(verdict.usb_class)
+        if expected and spin in ("rotating", "solid-state"):
+            agree = expected == spin
+            note = Text("\n  ")
+            note.append("분류기와 실측: ", style="bold dim")
+            note.append(f"{verdict.usb_class} ", style="bold")
+            note.append("says " + expected, style="dim")
+            note.append("  ·  measured " + spin, style="dim")
+            note.append("   일치" if agree else "   불일치", 
+                        style="bold green" if agree else "bold red")
+            body.append(note)
+            if not agree:
+                body.append(Text(
+                    "  the two disagree, and the measurement is the one that "
+                    "touched the medium — a bridge that misreports VPD 0xB1 is "
+                    "exactly the failure this probe exists to catch.",
+                    style="dim italic"))
+
+    state.console.print(Panel(Group(*body), title="disk bench", title_align="left",
+                              border_style="bright_green", box=box.ROUNDED))
+
+
+def _resolve_block(state: State, target: str) -> str:
+    """A node path, a bare name, an image file, or anything `updev show` matches."""
+    want = target.strip()
+    if Path(want).is_file() or (want.startswith("/dev/") and Path(want).exists()):
+        return want
+    if Path(f"/dev/{want}").exists():
+        return f"/dev/{want}"
+    result = state.scan(include=frozenset({"storage"}))
+    for dev in result.find(want):
+        if dev.node:
+            return dev.node
+    state.console.print(f"[red]no block device matches[/] [bold]{target}[/]")
+    state.console.print("[dim]run[/] [bold cyan]updev scan -k storage[/]")
+    raise SystemExit(1)
+
+
+# ==========================================================================
+# hid — what the keyboard is actually sending
+# ==========================================================================
+
+@cli.group()
+def hid():
+    """Keyboards, mice, gamepads — the events, as the kernel decoded them."""
+
+
+@hid.command("list")
+@pass_state
+def hid_list(state: State):
+    """Every input device with an event node."""
+    from .hid import event_nodes
+
+    root = Path("/sys/class/input")
+    rows = []
+    for entry in sorted(root.glob("input*")) if root.is_dir() else []:
+        for node in event_nodes(entry):
+            rows.append(node)
+
+    if state.as_json:
+        state.emit({"devices": [n.as_dict() for n in rows]})
+        return
+    if not rows:
+        state.console.print("[yellow]no input devices[/]")
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+    table.add_column("node", style="bold")
+    table.add_column("name")
+    table.add_column("emits", style="dim")
+    table.add_column("access", style="dim")
+    for node in rows:
+        table.add_row(node.path, node.name, ", ".join(node.capabilities) or "—",
+                      "readable" if node.readable else "no access")
+    state.console.print(table)
+
+
+@hid.command("watch")
+@click.argument("target")
+@click.option("-d", "--duration", type=float, default=0.0,
+              help="Stop after this many seconds.")
+@click.option("-n", "--limit", type=int, default=0, help="Stop after this many events.")
+@click.option("--all-events", is_flag=True,
+              help="Include the SYN/MSC framing events too.")
+@pass_state
+def hid_watch(state: State, target, duration, limit, all_events):
+    """키보드·마우스가 실제로 보내는 이벤트를 그대로.
+
+    TARGET is a USB address (1-2.2), an input directory (input29), an event
+    node (event5) or part of the device's name. A composite receiver is
+    several event nodes and all of them are watched.
+
+    Reading a keyboard's event node means reading everything typed on it,
+    passwords included — which is why the target is required and why this
+    prints what it opened before it starts.
+    """
+    from .hid import describe, resolve, watch
+
+    nodes = resolve(target)
+    if not nodes:
+        state.console.print(f"[red]no input device matches[/] [bold]{target}[/]")
+        state.console.print("[dim]run[/] [bold cyan]updev hid list[/]")
+        raise SystemExit(1)
+
+    blocked = [n for n in nodes if not n.readable]
+    if blocked and len(blocked) == len(nodes):
+        state.console.print(f"[red]no read access to[/] {', '.join(n.path for n in blocked)}")
+        state.console.print("[dim]add yourself to the input group:[/] "
+                            "[bold cyan]sudo usermod -aG input $USER[/]"
+                            "[dim]   (then log out and back in)[/]")
+        raise SystemExit(1)
+
+    readable_nodes = [n for n in nodes if n.readable]
+    if not state.as_json:
+        for node in readable_nodes:
+            state.console.print(Text("watching ", style="dim")
+                                .append(node.path, style="bold")
+                                .append(f"   {node.name}", style="dim"))
+        if any("keys" in n.capabilities for n in readable_nodes):
+            state.console.print(Text(
+                "이 장치는 키 입력을 보냅니다 — 여기 찍히는 건 실제로 입력되는 "
+                "내용입니다.", style="yellow"))
+        state.console.print(Text("ctrl-c 로 종료", style="dim italic"))
+
+    count = 0
+    try:
+        for node, event in watch(readable_nodes, duration=duration, quiet=not all_events):
+            count += 1
+            if state.as_json:
+                click.echo(json.dumps({"node": node.path, **event.as_dict()},
+                                      ensure_ascii=False), nl=True)
+            else:
+                line = Text(time.strftime("%H:%M:%S "), style="dim")
+                line.append(f"{Path(node.path).name:<8}", style="dim")
+                line.append(describe(event),
+                            style="bold" if event.type == 0x01 else "")
+                state.console.print(line)
+            if limit and count >= limit:
+                break
+    except KeyboardInterrupt:
+        pass
+    if not state.as_json:
+        state.console.print(Text(f"\n{count} event(s)", style="dim"))
+
+
+# ==========================================================================
+# nfc — readers on jumper wires
+# ==========================================================================
+
+@cli.group()
+def nfc():
+    """NFC readers wired to the 40-pin header: MFRC522 and PN532.
+
+    These modules cannot announce themselves — SPI has no enumeration and I2C
+    has one fixed address — so start with `updev nfc wiring`, wire it, then
+    `updev nfc detect`.
+    """
+
+
+@nfc.command("wiring")
+@click.argument("module", required=False)
+@pass_state
+def nfc_wiring(state: State, module):
+    """점퍼선 배선표 — 어느 핀에 뭘 꽂는지.
+
+    MODULE picks one entry (rc522, spi, i2c, uart); omit it for all of them.
+    """
+    from .backends.nfc import missing_buses
+    from .nfc import WIRINGS, wiring_for
+
+    wanted = [wiring_for(module)] if module else list(WIRINGS)
+    if module and wanted[0] is None:
+        state.console.print(f"[red]no wiring for[/] [bold]{module}[/]")
+        state.console.print("[dim]try: rc522, spi, i2c, uart[/]")
+        raise SystemExit(1)
+
+    if state.as_json:
+        state.emit({
+            "wirings": [w.as_dict() for w in wanted],
+            "missing_buses": [{"bus": b, "enable": fix} for b, fix in missing_buses()],
+        })
+        return
+
+    for wiring in wanted:
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        table.add_column("모듈 핀", style="bold")
+        table.add_column("", style="dim", justify="center")
+        table.add_column("40핀 헤더", justify="right", style="bold bright_yellow")
+        table.add_column("파이 쪽 이름", style="dim")
+        for name, pin, pi_name in wiring.wires:
+            table.add_row(name, "→", f"pin {pin}", pi_name)
+        body = Group(
+            table,
+            Text(),
+            Text(wiring.note, style="dim italic"),
+            Text("\n확인 방법  ", style="dim").append(wiring.probe, style="cyan"),
+        )
+        state.console.print(Panel(
+            body, title=f"{wiring.module}   [{wiring.bus}]", title_align="left",
+            border_style="bright_red", box=box.ROUNDED,
+        ))
+
+    for bus, fix in missing_buses():
+        state.console.print(Text(f"\n{bus.upper()} 가 꺼져 있습니다 — ", style="yellow")
+                            .append("배선해도 아무것도 안 보입니다.", style="yellow dim"))
+        state.console.print(Text("  $ ", style="dim").append(fix, style="bold cyan"))
+
+    state.console.print(Text("\n배선 끝났으면  ", style="dim")
+                        .append("updev nfc detect", style="bold cyan"))
+
+
+@nfc.command("detect")
+@click.option("-v", "--verbose", is_flag=True, help="Show the buses that stayed silent.")
+@click.option("--uart", is_flag=True,
+              help="Also probe /dev/serial0 (off by default — the console usually owns it).")
+@click.option("--no-spi", is_flag=True, help="Skip SPI; I2C only.")
+@pass_state
+def nfc_detect(state: State, verbose, uart, no_spi):
+    """리더가 붙어있는지 물어본다 — SPI·I2C(·UART)를 차례로.
+
+    SPI has no addressing, so this clocks a register read out to whatever is
+    on each chip-select. That is safe for an RC522 or a PN532 and harmless for
+    most things, but it is why the scan backend won't do it without --deep.
+    """
+    from .backends.nfc import probe_all
+
+    readers = probe_all(spi=not no_spi, i2c=True, uart=uart)
+    found = [r for r in readers if r.found]
+
+    if state.as_json:
+        state.emit({"readers": [r.as_dict() for r in readers],
+                    "found": len(found)})
+        return
+
+    for reader in found:
+        body = Table.grid(padding=(0, 2))
+        body.add_column(style="dim", justify="right", no_wrap=True, min_width=10)
+        body.add_column(overflow="fold")
+        body.add_row("module", Text(reader.module, style="bold"))
+        body.add_row("transport", reader.transport)
+        body.add_row("where", reader.where)
+        body.add_row("firmware", Text(reader.detail, style="bright_green"))
+        state.console.print(Panel(body, title="찾음", title_align="left",
+                                  border_style="bright_green", box=box.ROUNDED))
+
+    if not found:
+        state.console.print("[yellow]아무 리더도 대답하지 않았습니다[/]")
+        state.console.print("[dim]배선표:[/] [bold cyan]updev nfc wiring[/]")
+
+    if verbose or not found:
+        table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+        table.add_column("probed", style="bold")
+        table.add_column("result")
+        for reader in readers:
+            table.add_row(
+                f"{reader.module} · {reader.where}",
+                Text("found", style="green") if reader.found
+                else Text(reader.error or "no answer", style="dim"),
+            )
+        state.console.print(table)
+
+    if found:
+        state.console.print(Text("\n태그 올려보기  ", style="dim")
+                            .append("updev nfc poll", style="bold cyan"))
+
+
+@nfc.command("read")
+@click.option("-t", "--timeout", type=float, default=8.0, show_default=True,
+              help="Seconds to wait for a tag.")
+@click.option("--uart", is_flag=True, help="Include the UART reader in the search.")
+@pass_state
+def nfc_read(state: State, timeout, uart):
+    """태그 하나 읽기 — UID·ATQA·SAK 와 그게 무슨 카드인지."""
+    from .nfc import atqa_describe
+
+    chip, close, reader = _open_nfc(state, uart=uart)
+    try:
+        tag = _wait_for_tag(state, chip, timeout)
+    finally:
+        close()
+
+    if tag is None:
+        if state.as_json:
+            state.emit({"tag": None, "reader": reader.where})
+        else:
+            state.console.print(f"[yellow]{timeout:.0f}초 동안 태그가 없었습니다[/]")
+        raise SystemExit(1)
+
+    if state.as_json:
+        state.emit({"tag": tag.as_dict(), "reader": reader.where})
+        return
+
+    body = Table.grid(padding=(0, 2))
+    body.add_column(style="dim", justify="right", no_wrap=True, min_width=8)
+    body.add_column(overflow="fold")
+    body.add_row("UID", Text(tag.uid_hex, style="bold bright_green"))
+    body.add_row("kind", Text(tag.kind, style="bold"))
+    if tag.atqa:
+        body.add_row("ATQA", atqa_describe(tag.atqa))
+    if tag.sak >= 0:
+        body.add_row("SAK", f"0x{tag.sak:02x}")
+    body.add_row("reader", tag.reader)
+    state.console.print(Panel(body, title="태그", title_align="left",
+                              border_style="bright_green", box=box.ROUNDED))
+    if tag.sak in (0x08, 0x09, 0x18, 0x19):
+        state.console.print(Text("MIFARE Classic — 섹터 덤프:  ", style="dim")
+                            .append("updev nfc dump --sector 1", style="bold cyan"))
+
+
+@nfc.command("poll")
+@click.option("-d", "--duration", type=float, default=0.0,
+              help="Stop after this many seconds.")
+@click.option("-n", "--limit", type=int, default=0, help="Stop after this many tags.")
+@click.option("--repeat", is_flag=True, help="Report a tag every pass, not just on change.")
+@click.option("--uart", is_flag=True, help="Include the UART reader in the search.")
+@pass_state
+def nfc_poll(state: State, duration, limit, repeat, uart):
+    """태그를 계속 기다린다 — 올릴 때마다 한 줄.
+
+    The NFC counterpart of `updev usb zone`: hold a card on the reader and it
+    says what it is.
+    """
+    from .nfc import NfcError
+
+    chip, close, reader = _open_nfc(state, uart=uart)
+    if not state.as_json:
+        state.console.print(Text("태그를 리더에 올리세요 — ", style="bold")
+                            .append(f"{reader.module} · {reader.where}", style="dim"))
+        state.console.print(Text("ctrl-c 로 종료", style="dim italic"))
+
+    seen = ""
+    count = 0
+    deadline = time.time() + duration if duration else None
+    try:
+        while deadline is None or time.time() < deadline:
+            try:
+                tag = chip.poll()
+            except NfcError:
+                seen = ""
+                time.sleep(0.15)
+                continue
+            if tag.uid_hex != seen or repeat:
+                seen = tag.uid_hex
+                count += 1
+                if state.as_json:
+                    click.echo(json.dumps(tag.as_dict(), ensure_ascii=False))
+                else:
+                    line = Text(time.strftime("%H:%M:%S "), style="dim")
+                    line.append(tag.uid_hex, style="bold bright_green")
+                    line.append(f"   {tag.kind}", style="dim")
+                    state.console.print(line)
+                if limit and count >= limit:
+                    break
+            time.sleep(0.15)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        close()
+    if not state.as_json:
+        state.console.print(Text(f"\n{count} tag(s)", style="dim"))
+
+
+@nfc.command("dump")
+@click.option("-s", "--sector", type=int, default=1, show_default=True,
+              help="MIFARE Classic sector to read.")
+@click.option("--key", default="FFFFFFFFFFFF", show_default=True,
+              help="6-byte key A, as hex.")
+@click.option("-t", "--timeout", type=float, default=8.0, show_default=True)
+@click.option("--uart", is_flag=True, help="Include the UART reader in the search.")
+@pass_state
+def nfc_dump(state: State, sector, key, timeout, uart):
+    """MIFARE Classic 한 섹터를 읽는다 (읽기 전용).
+
+    Blocks are read, never written. The default key is the factory
+    FFFFFFFFFFFF, which is what an unwritten card ships with; a keyed card
+    fails authentication and says so rather than guessing.
+    """
+    from .nfc import (
+        Mfrc522,
+        NfcError,
+        ascii_dump,
+        describe_block,
+        hexdump,
+        sector_blocks,
+    )
+
+    try:
+        key_bytes = bytes.fromhex(key.replace(":", "").replace(" ", ""))
+    except ValueError:
+        raise click.UsageError(f"--key must be hex, got {key!r}")
+    if len(key_bytes) != 6:
+        raise click.UsageError(f"--key must be 6 bytes, got {len(key_bytes)}")
+    if sector < 0 or sector > 39:
+        raise click.UsageError("MIFARE Classic has sectors 0-39")
+
+    chip, close, reader = _open_nfc(state, uart=uart)
+    rows = []
+    try:
+        tag = _wait_for_tag(state, chip, timeout)
+        if tag is None:
+            if state.as_json:
+                state.emit({"tag": None})
+            else:
+                state.console.print(f"[yellow]{timeout:.0f}초 동안 태그가 없었습니다[/]")
+            raise SystemExit(1)
+
+        for block in sector_blocks(sector):
+            try:
+                if isinstance(chip, Mfrc522):
+                    chip.authenticate(block, tag.uid, key_bytes)
+                    data = chip.read_block(block)
+                else:
+                    data = chip.read_block(block, tag.uid, key_bytes)
+                rows.append((block, data, ""))
+            except NfcError as e:
+                rows.append((block, b"", str(e)))
+        if isinstance(chip, Mfrc522):
+            chip.stop_crypto()
+            chip.halt()
+    finally:
+        close()
+
+    if state.as_json:
+        state.emit({
+            "tag": tag.as_dict(),
+            "sector": sector,
+            "blocks": [
+                {"block": b, "hex": hexdump(d), "ascii": ascii_dump(d),
+                 "role": describe_block(b, d), "error": err}
+                for b, d, err in rows
+            ],
+        })
+        return
+
+    table = Table(box=box.SIMPLE, show_edge=False, header_style="dim")
+    table.add_column("blk", justify="right", style="dim")
+    table.add_column("16 bytes", style="bold")
+    table.add_column("ascii")
+    table.add_column("", style="dim")
+    for block, data, error in rows:
+        if error:
+            table.add_row(str(block), Text(error, style="red"), "", "")
+            continue
+        table.add_row(str(block), hexdump(data), ascii_dump(data),
+                      describe_block(block, data))
+    state.console.print(Panel(
+        table, title=f"sector {sector}   ·   UID {tag.uid_hex}   ·   {tag.kind}",
+        title_align="left", border_style="bright_red", box=box.ROUNDED,
+    ))
+
+
+def _open_nfc(state: State, uart: bool = False):
+    """Find a reader and open it, or explain what to check. (chip, close, reader)."""
+    from .backends.nfc import open_reader, probe_all
+
+    readers = [r for r in probe_all(spi=True, i2c=True, uart=uart) if r.found]
+    if not readers:
+        state.console.print("[red]리더를 찾지 못했습니다[/]")
+        state.console.print("[dim]배선 확인:[/] [bold cyan]updev nfc wiring[/]"
+                            "[dim]   ·   자세히:[/] [bold cyan]updev nfc detect -v[/]")
+        raise SystemExit(1)
+    reader = readers[0]
+    try:
+        chip, close = open_reader(reader)
+    except OSError as e:
+        state.console.print(f"[red]{reader.where}: {e.strerror or e}[/]")
+        raise SystemExit(1)
+    return chip, close, reader
+
+
+def _wait_for_tag(state: State, chip, timeout: float):
+    """Poll until a tag answers or the clock runs out."""
+    from .nfc import NfcError
+
+    deadline = time.time() + max(0.1, timeout)
+    while time.time() < deadline:
+        try:
+            return chip.poll()
+        except NfcError:
+            time.sleep(0.15)
+    return None
+
+
+# ==========================================================================
 # I2C
 # ==========================================================================
 
@@ -1984,6 +4001,151 @@ def power(state: State):
         state.emit(dev.as_dict())
         return
     state.console.print(render.device_detail(dev))
+
+
+# ==========================================================================
+# panel — the ST7735S front panel
+# ==========================================================================
+
+_PANEL_WIRING = """[dim]VCC[/]→3V3  [dim]GND[/]→GND  [dim]SCL[/]→GPIO11  [dim]SDA[/]→GPIO10
+[dim]RES[/]→GPIO25  [dim]DC[/]→GPIO24  [dim]CS[/]→GPIO8 (CE0)  [dim]BLK[/]→3V3"""
+
+
+def _panel_options(f):
+    """Wiring flags shared by every panel subcommand."""
+    for option in reversed([
+        click.option("--spi", "target", default="0.0", show_default=True,
+                     metavar="BUS.CS", help="Which spidev node the panel is on."),
+        click.option("--dc", type=int, default=24, show_default=True,
+                     help="BCM pin wired to DC."),
+        click.option("--rst", type=int, default=25, show_default=True,
+                     help="BCM pin wired to RES."),
+        click.option("--backlight", type=int, default=None,
+                     help="BCM pin wired to BLK, if you drive it."),
+        click.option("--speed", type=int, default=8_000_000, show_default=True,
+                     help="SPI clock in Hz."),
+        click.option("--bgr", is_flag=True,
+                     help="Swap red and blue — some ST7735S panels are wired BGR."),
+        click.option("--capture", type=click.Path(file_okay=False), default=None,
+                     help="Also save every frame here as PNG."),
+    ]):
+        f = option(f)
+    return f
+
+
+def _open_panel(state: State, target, dc, rst, backlight, speed, bgr, capture,
+                required: bool = True):
+    from .panel import PanelUnavailable, open_panel
+
+    port, cs = _parse_spi_target(target)
+    try:
+        screen = open_panel(port=port, cs=cs, dc=dc, rst=rst, backlight=backlight,
+                            speed_hz=speed, bgr=bgr,
+                            capture=Path(capture) if capture else None,
+                            required=required)
+    except PanelUnavailable as e:
+        state.console.print(f"[red]no panel:[/] {e}")
+        state.console.print(Panel(_PANEL_WIRING, title="expected wiring",
+                                  title_align="left", border_style="dim",
+                                  box=box.ROUNDED))
+        raise SystemExit(1) from e
+    if not screen.live:
+        state.console.print("[yellow]no panel — drawing to memory only[/]")
+    return screen
+
+
+@cli.group()
+def panel():
+    """The ST7735S front panel: what the board is doing, on the glass.
+
+    A 128x160 SPI display showing the same scan the CLI and GUI show. `updev
+    panel boot` is meant to run at startup — it leaves its summary on screen
+    after it exits, so the panel keeps reading as a status display with
+    nothing running.
+    """
+
+
+@panel.command("boot")
+@_panel_options
+@click.option("--splash", type=float, default=0.8, show_default=True,
+              help="Minimum seconds to hold the splash before progress rows.")
+@click.option("--hold", type=float, default=0.0,
+              help="Seconds to sit on the summary before exiting.")
+@click.option("--blank", is_flag=True,
+              help="Clear the panel on exit instead of leaving the summary up.")
+@pass_state
+def panel_boot(state: State, target, dc, rst, backlight, speed, bgr, capture,
+               splash, hold, blank):
+    """Boot screen: splash, live backend progress, then the summary.
+
+    The progress rows are the useful part — each backend ticks over as its
+    report lands, so a bus that hangs is named on screen instead of showing up
+    as a display that never changes.
+    """
+    from .panel import boot as run_boot
+
+    screen = _open_panel(state, target, dc, rst, backlight, speed, bgr, capture)
+    try:
+        result = run_boot(screen, state.scanner, state.ctx,
+                          splash_s=splash, hold_s=hold)
+    finally:
+        screen.close(blank=blank)
+
+    if state.as_json:
+        state.emit(result.as_dict())
+        return
+    ok = sum(1 for r in result.reports if r.available and r.ok)
+    state.console.print(
+        f"[green]panel[/] {len(result.devices)} devices · "
+        f"{ok}/{len(result.reports)} backends · {result.duration:.1f}s"
+        + ("" if blank else " [dim](summary left on screen)[/]")
+    )
+
+
+@panel.command("test")
+@_panel_options
+@pass_state
+def panel_test(state: State, target, dc, rst, backlight, speed, bgr, capture):
+    """Colour bars and a pixel grid — is it wired right, and is it BGR?
+
+    If the bars read blue-green-red instead of red-green-blue, the panel is
+    BGR: re-run with `--bgr`.
+    """
+    from .panel.screen import ACCENT, BLACK, DIM, FG, WIDTH
+
+    screen = _open_panel(state, target, dc, rst, backlight, speed, bgr, capture)
+    try:
+        screen.clear(BLACK)
+        bars = [("R", (255, 0, 0)), ("G", (0, 255, 0)), ("B", (0, 0, 255)),
+                ("W", (255, 255, 255))]
+        for i, (label, colour) in enumerate(bars):
+            screen.fill((0, i * 20, WIDTH, i * 20 + 19), colour)
+            screen.text(4, i * 20 + 4, label, BLACK, size=11, bold=True)
+        y = 88
+        y = screen.text(4, y, f"spidev{target}", FG, size=9)
+        y = screen.text(4, y, f"DC {dc}  RST {rst}", DIM, size=9)
+        y = screen.text(4, y, f"{speed / 1e6:.0f} MHz", DIM, size=9)
+        y = screen.text(4, y, "BGR" if bgr else "RGB", DIM, size=9)
+        # Corner marks: if any is clipped, the offsets are wrong for this panel.
+        for cx, cy in ((0, 0), (WIDTH - 1, 0), (0, 159), (WIDTH - 1, 159)):
+            screen.fill((cx - 3, cy - 3, cx + 3, cy + 3), ACCENT)
+        screen.flush()
+    finally:
+        screen.close()
+    state.console.print(
+        "[green]drew test pattern[/] [dim]— bars top to bottom should read "
+        "red, green, blue, white; all four corner marks should be visible[/]"
+    )
+
+
+@panel.command("off")
+@_panel_options
+@pass_state
+def panel_off(state: State, target, dc, rst, backlight, speed, bgr, capture):
+    """Blank the panel and let go of it."""
+    screen = _open_panel(state, target, dc, rst, backlight, speed, bgr, capture)
+    screen.close(blank=True)
+    state.console.print("[dim]panel cleared[/]")
 
 
 # ==========================================================================
