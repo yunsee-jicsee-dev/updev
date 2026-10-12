@@ -25,6 +25,7 @@ from updev.core.util import (
     usb_address_from_path,
 )
 from updev.backends.display import parse_edid
+from updev.backends.ir import IrBackend, device_from_state
 from updev.floppy import (
     FLOPPY_SIZE,
     boot_message,
@@ -1268,6 +1269,47 @@ class TestSerialisation(unittest.TestCase):
         self.assertEqual(payload["actions"][0]["name"], "read")
         self.assertEqual(payload["metrics"]["temp_c"], 42.5)
 
+
+
+class TestIrState(unittest.TestCase):
+    """The IR backend only reads ir_lcd.py's JSON state file; check each state maps sanely."""
+
+    BASE = {"version": 1, "pid": 1, "pin": 18, "started": 0.0, "updated": 0.0, "count": 0, "last": None}
+
+    def test_listening_without_codes_is_idle(self):
+        d = device_from_state(dict(self.BASE), now=10.0, alive=True)
+        self.assertEqual(d.uid, "ir:gpio18")
+        self.assertEqual(d.kind, Kind.IR)
+        self.assertEqual(d.status, Status.IDLE)
+
+    def test_last_code_shows_temperature(self):
+        st = dict(self.BASE, count=1,
+                  last={"code": "0x8808A46", "data": "0x08A4", "temp_c": 25, "time": 100.0})
+        d = device_from_state(st, now=103.0, alive=True)
+        self.assertEqual(d.status, Status.ONLINE)
+        self.assertIn("25°C", d.summary)
+        self.assertEqual(d.metrics["temp_c"], 25.0)
+
+    def test_dead_writer_is_degraded_with_fix(self):
+        d = device_from_state(dict(self.BASE), now=0.0, alive=False)
+        self.assertEqual(d.status, Status.DEGRADED)
+        self.assertEqual(d.worst, Severity.WARN)
+        self.assertIn("ir_lcd.py", d.issues[0].fix)
+
+    def test_unknown_version_is_flagged(self):
+        d = device_from_state(dict(self.BASE, version=99), now=0.0, alive=True)
+        self.assertEqual(d.status, Status.DEGRADED)
+
+    def test_missing_state_file_means_unavailable(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["IR_AC_STATE"] = os.path.join(tmp, "none.json")
+            try:
+                ok, why = IrBackend().available(ProbeContext())
+            finally:
+                del os.environ["IR_AC_STATE"]
+        self.assertFalse(ok)
+        self.assertIn("ir_lcd.py", why)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
