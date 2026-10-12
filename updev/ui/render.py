@@ -77,6 +77,7 @@ KIND_STYLE: dict[Kind, str] = {
     Kind.NET_HOST: "bright_blue",
     Kind.BLUETOOTH: "blue",
     Kind.DISPLAY: "magenta",
+    Kind.IR: "bright_red",
     Kind.UNKNOWN: "white",
 }
 
@@ -96,6 +97,7 @@ KIND_TITLE: dict[Kind, str] = {
     Kind.NET_HOST: "LAN neighbours",
     Kind.BLUETOOTH: "Bluetooth",
     Kind.DISPLAY: "Display",
+    Kind.IR: "IR remote",
     Kind.UNKNOWN: "Other",
 }
 
@@ -103,7 +105,7 @@ KIND_TITLE: dict[Kind, str] = {
 KIND_ORDER: tuple[Kind, ...] = (
     Kind.HOST, Kind.SOC, Kind.POWER, Kind.THERMAL, Kind.STORAGE, Kind.USB,
     Kind.I2C, Kind.SPI, Kind.SERIAL, Kind.CAMERA, Kind.GPIO,
-    Kind.NET_IFACE, Kind.NET_HOST, Kind.BLUETOOTH, Kind.DISPLAY, Kind.UNKNOWN,
+    Kind.NET_IFACE, Kind.NET_HOST, Kind.BLUETOOTH, Kind.DISPLAY, Kind.IR, Kind.UNKNOWN,
 )
 
 

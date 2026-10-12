@@ -31,6 +31,7 @@ class Kind(StrEnum):
     NET_HOST = "net-host"
     BLUETOOTH = "bluetooth"
     DISPLAY = "display"
+    IR = "ir"              # IR remote receiver (state comes from ir_lcd.py)
     THERMAL = "thermal"
     UNKNOWN = "unknown"
 

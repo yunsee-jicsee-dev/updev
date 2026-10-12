@@ -13,6 +13,7 @@ from .display import DisplayBackend
 from .gpio import GpioBackend
 from .host import HostBackend
 from .i2c import I2cBackend
+from .ir import IrBackend
 from .network import LanBackend, NetworkBackend
 from .serial_ import SerialBackend
 from .spi import SpiBackend
@@ -29,6 +30,7 @@ BACKEND_CLASSES: tuple[type[Backend], ...] = (
     CameraBackend,
     DisplayBackend,
     GpioBackend,
+    IrBackend,
     NetworkBackend,
     BluetoothBackend,
     LanBackend,
