@@ -51,7 +51,7 @@ TOPICS: list[Topic] = [
             "updev는 보드에 붙은 모든 것을 하나의 모델(Device)로 통일한다. "
             "lsusb·i2cdetect·lsblk·ip·vcgencmd·pinctrl·v4l2-ctl를 따로 치고 "
             "머릿속에서 합치던 걸 대신 해준다.\n\n"
-            "백엔드 12개가 각자 자기 영역을 훑고, 스레드 풀에서 개별 타임아웃을 "
+            "백엔드 13개가 각자 자기 영역을 훑고, 스레드 풀에서 개별 타임아웃을 "
             "갖고 병렬로 돈다. 하나가 죽어도 스캔 전체는 죽지 않는다 — "
             "`updev backends`로 누가 돌았고 누가 실패했는지 볼 수 있다.\n\n"
             "모든 명령에 --json이 붙는다."
@@ -179,6 +179,26 @@ TOPICS: list[Topic] = [
             ("updev gpio pins", "40핀 헤더를 실물 배치대로"),
             ("updev serial ports", "USB-시리얼 + 온보드 UART"),
             ("updev serial monitor ttyUSB0 -b 115200", "수신 전용 모니터"),
+        ],
+    ),
+    Topic(
+        name="ir",
+        title="IR 리모컨 (VS1838)",
+        blurb="에어컨 리모컨이 마지막으로 보낸 값",
+        body=(
+            "VS1838B 수신기(38kHz, 출력 active-low)를 GPIO18에 물리고 jicsee1의 "
+            "pixel_chinese_quiz/ir_lcd.py가 신호를 해독한다. 마이크로초 단위 엣지 "
+            "타이밍이 필요해서 GPIO는 그 프로그램 하나만 잡는다 — updev는 핀을 "
+            "건드리지 않고 /tmp/ir_ac.json 상태 파일만 읽는다($IR_AC_STATE로 변경).\n\n"
+            "LG 에어컨 28비트 코드를 풀어서 온도뿐 아니라 모드·팬·체크섬까지 "
+            "보여준다. 체크섬이 틀리면 거리·각도·햇빛 노이즈로 프레임이 깨진 것.\n\n"
+            "배선: OUT→GPIO18, VCC→3V3(5V 아님), GND→GND."
+        ),
+        commands=[
+            ("updev ir status", "마지막 설정 온도·모드·팬"),
+            ("updev ir watch", "버튼 누를 때마다 실시간 출력"),
+            ("updev ir decode 0x8808A46", "코드 직접 해독"),
+            ("updev scan -k ir", "스캔 결과 중 IR만"),
         ],
     ),
     Topic(

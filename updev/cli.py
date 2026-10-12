@@ -74,8 +74,8 @@ pass_state = click.make_pass_decorator(State, ensure=True)
 def cli(ctx, as_json, no_color, deep, timeout, backends, excluded, width):
     """updev — one device manager for the whole board.
 
-    LAN, USB, I2C, SPI, serial, cameras, GPIO, storage, Bluetooth and the
-    Raspberry Pi itself, in one place.
+    LAN, USB, I2C, SPI, serial, cameras, GPIO, IR remote, storage, Bluetooth
+    and the Raspberry Pi itself, in one place.
     """
     state = State()
     state.console = render.make_console(no_color=no_color, width=width)
@@ -1969,6 +1969,108 @@ def _pin_cells(pin: int, pins: dict) -> dict[str, Text]:
         "function": Text(func, style="dim"),
         "state": Text(shown, style=style),
     }
+
+
+@cli.group()
+def ir():
+    """IR remote receiver (VS1838 + ir_lcd.py)."""
+
+
+@ir.command("status")
+@pass_state
+def ir_status(state: State):
+    """What the air conditioner was last told, read from ir_lcd.py's state file."""
+    from .backends.ir import state_path
+
+    result = state.scan(include=frozenset({"ir"}))
+    devs = [d for d in result.devices if d.kind == Kind.IR]
+    if state.as_json:
+        state.emit({"state_file": state_path(), "devices": [d.as_dict() for d in devs]})
+        return
+    if not devs:
+        state.console.print(f"[yellow]no IR receiver[/] [dim]({state_path()} not found — "
+                            "start ir_lcd.py in jicsee1/pixel_chinese_quiz)[/]")
+        raise SystemExit(1)
+    for dev in devs:
+        state.console.print(render.device_detail(dev))
+
+
+@ir.command("watch")
+@click.option("-i", "--interval", type=float, default=0.5, show_default=True,
+              help="How often to re-read the state file, in seconds.")
+@click.option("-d", "--duration", type=float, default=0.0,
+              help="Stop after this many seconds (0 = until Ctrl-C).")
+@pass_state
+def ir_watch(state: State, interval, duration):
+    """Print each new code as ir_lcd.py decodes it. Read-only."""
+    from .backends.ir import decode_lg, parse_code, read_state, state_path
+
+    state.console.print(f"[green]watching[/] [bold]{state_path()}[/] "
+                        "[dim](press remote buttons, Ctrl-C to stop)[/]")
+    seen = None
+    deadline = time.time() + duration if duration else None
+    try:
+        while deadline is None or time.time() < deadline:
+            try:
+                st = read_state()
+            except ValueError:
+                st = None
+            last = (st or {}).get("last") or {}
+            key = ((st or {}).get("count"), last.get("time"))
+            if seen is not None and last and key != seen:     # skip what was there at start
+                try:
+                    info = decode_lg(parse_code(last.get("code", ""))) or {}
+                except ValueError:
+                    info = {}
+                if state.as_json:
+                    click.echo(json.dumps({"time": last.get("time"), "code": last.get("code"),
+                                           "temp_c": last.get("temp_c"), **info},
+                                          ensure_ascii=False))
+                else:
+                    stamp = time.strftime("%H:%M:%S",
+                                          time.localtime(last.get("time") or time.time()))
+                    extra = f"  {info['mode']} · fan {info['fan']}" if info.get("mode") else ""
+                    bad = "" if info.get("checksum_ok", True) else "  [red]bad checksum[/]"
+                    state.console.print(f"[dim]{stamp}[/]  [bold]{last.get('code')}[/]  "
+                                        f"[cyan]{last.get('temp_c')}°C[/]{extra}{bad}")
+            seen = key
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+@ir.command("decode")
+@click.argument("codes", nargs=-1, required=True)
+@pass_state
+def ir_decode(state: State, codes):
+    """Unpack LG AC codes, e.g. `updev ir decode 0x8808A46 0x88C0051`."""
+    from .backends.ir import decode_lg, parse_code
+
+    rows = []
+    for text in codes:
+        try:
+            info = decode_lg(parse_code(text))
+        except ValueError:
+            info = None
+        rows.append((text, info))
+    if state.as_json:
+        state.emit({"codes": [{"input": t, "lg": i} for t, i in rows]})
+        return
+    table = Table(box=box.SIMPLE, header_style="dim bold")
+    for col in ("code", "power", "mode", "temp", "fan", "checksum"):
+        table.add_column(col)
+    for text, info in rows:
+        if info is None:
+            table.add_row(text, Text("not an LG AC code", style="yellow"), "", "", "", "")
+            continue
+        temp = info.get("temp_c")
+        table.add_row(info["code"], info["power"], info.get("mode", "-"),
+                      f"{temp}°C" if temp is not None else "-", info.get("fan", "-"),
+                      Text("ok", style="green") if info["checksum_ok"]
+                      else Text("bad", style="red"))
+    state.console.print(table)
+    if any(i is None for _, i in rows):
+        raise SystemExit(1)
 
 
 @cli.command()

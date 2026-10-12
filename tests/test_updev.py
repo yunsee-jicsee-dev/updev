@@ -9,6 +9,7 @@ Run with:  python3 -m unittest discover -s tests   (or pytest, if installed)
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from updev.backends.host import _decode_revision, _explain_boot_order
@@ -25,6 +26,7 @@ from updev.core.util import (
     usb_address_from_path,
 )
 from updev.backends.display import parse_edid
+from updev.backends.ir import IrBackend, decode_lg, device_from_state, parse_code, read_state
 from updev.floppy import (
     FLOPPY_SIZE,
     boot_message,
@@ -1267,6 +1269,98 @@ class TestSerialisation(unittest.TestCase):
         self.assertEqual(payload["issues"][0]["fix"], "add a heatsink")
         self.assertEqual(payload["actions"][0]["name"], "read")
         self.assertEqual(payload["metrics"]["temp_c"], 42.5)
+
+
+
+class TestIrState(unittest.TestCase):
+    """The IR backend only reads ir_lcd.py's JSON state file; check each state maps sanely."""
+
+    BASE = {"version": 1, "pid": 1, "pin": 18, "started": 0.0, "updated": 0.0, "count": 0, "last": None}
+
+    def test_listening_without_codes_is_idle(self):
+        d = device_from_state(dict(self.BASE), now=10.0, alive=True)
+        self.assertEqual(d.uid, "ir:gpio18")
+        self.assertEqual(d.kind, Kind.IR)
+        self.assertEqual(d.status, Status.IDLE)
+
+    def test_last_code_shows_temperature(self):
+        st = dict(self.BASE, count=1,
+                  last={"code": "0x8808A46", "data": "0x08A4", "temp_c": 25, "time": 100.0})
+        d = device_from_state(st, now=103.0, alive=True)
+        self.assertEqual(d.status, Status.ONLINE)
+        self.assertIn("25°C", d.summary)
+        self.assertEqual(d.metrics["temp_c"], 25.0)
+
+    def test_dead_writer_is_degraded_with_fix(self):
+        d = device_from_state(dict(self.BASE), now=0.0, alive=False)
+        self.assertEqual(d.status, Status.DEGRADED)
+        self.assertEqual(d.worst, Severity.WARN)
+        self.assertIn("ir_lcd.py", d.issues[0].fix)
+
+    def test_unknown_version_is_flagged(self):
+        d = device_from_state(dict(self.BASE, version=99), now=0.0, alive=True)
+        self.assertEqual(d.status, Status.DEGRADED)
+
+    def test_missing_state_file_means_unavailable(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["IR_AC_STATE"] = os.path.join(tmp, "none.json")
+            try:
+                ok, why = IrBackend().available(ProbeContext())
+            finally:
+                del os.environ["IR_AC_STATE"]
+        self.assertFalse(ok)
+        self.assertIn("ir_lcd.py", why)
+
+    def test_decode_lg_cool_25(self):
+        d = decode_lg(0x8808A46)
+        self.assertEqual((d["power"], d["mode"], d["temp_c"], d["fan"]), ("on", "cool", 25, "max"))
+        self.assertTrue(d["checksum_ok"])
+
+    def test_decode_lg_off(self):
+        d = decode_lg(parse_code("0x88C0051"))
+        self.assertEqual(d["power"], "off")
+        self.assertNotIn("temp_c", d)
+        self.assertTrue(d["checksum_ok"])
+
+    def test_decode_rejects_non_lg_and_bad_checksum(self):
+        self.assertIsNone(decode_lg(0x20DF10EF))       # NEC TV code, not LG AC
+        self.assertFalse(decode_lg(0x8808A47)["checksum_ok"])
+
+    def test_summary_includes_mode_and_fan(self):
+        st = dict(self.BASE, count=1, last={"code": "0x8808A46", "temp_c": 25, "time": 100.0})
+        d = device_from_state(st, now=101.0, alive=True)
+        self.assertIn("cool", d.summary)
+        self.assertEqual(d.detail["fan"], "max")
+
+    def test_bad_checksum_is_flagged(self):
+        st = dict(self.BASE, count=1, last={"code": "0x8808A47", "temp_c": 25, "time": 100.0})
+        d = device_from_state(st, now=101.0, alive=True)
+        self.assertTrue(any("checksum" in i.message for i in d.issues))
+
+    def test_long_quiet_receiver_goes_idle(self):
+        st = dict(self.BASE, count=1, last={"code": "0x8808A46", "temp_c": 25, "time": 0.0})
+        d = device_from_state(st, now=7 * 3600.0, alive=True)
+        self.assertEqual(d.status, Status.IDLE)
+
+    def test_corrupt_state_file_raises_valueerror(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "s.json")
+            with open(p, "w") as f:
+                f.write("{not json")
+            with self.assertRaises(ValueError):
+                read_state(p)
+            self.assertIsNone(read_state(os.path.join(tmp, "missing.json")))
+
+    def test_cli_decode(self):
+        from click.testing import CliRunner
+        from updev.cli import cli
+        r = CliRunner().invoke(cli, ["--json", "ir", "decode", "0x8808A46", "junk"])
+        self.assertEqual(r.exit_code, 0)
+        out = json.loads(r.output)["codes"]
+        self.assertEqual(out[0]["lg"]["temp_c"], 25)
+        self.assertIsNone(out[1]["lg"])
 
 
 if __name__ == "__main__":
